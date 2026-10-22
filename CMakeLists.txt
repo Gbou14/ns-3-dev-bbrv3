@@ -1,207 +1,384 @@
-# ##############################################################################
-# Required CMake version            #
-# ##############################################################################
-cmake_minimum_required(VERSION 3.25..3.25)
-
-# ##############################################################################
-# Project name                        #
-# ##############################################################################
-project(NS3 CXX)
-
-file(STRINGS VERSION NS3_VER)
-
-# minimum compiler versions
-set(AppleClang_MinVersion 17.0.0)
-set(Clang_MinVersion 17.0.0)
-set(GNU_MinVersion 11.0.0)
-
-# common options
-option(NS3_ASSERT "Enable assert on failure" OFF)
-option(NS3_DES_METRICS "Enable DES Metrics event collection" OFF)
-option(NS3_EXAMPLES "Enable examples to be built" OFF)
-option(NS3_LOG "Enable logging to be built" OFF)
-option(NS3_TESTS "Enable tests to be built" OFF)
-
-# fd-net-device options
-option(NS3_EMU "Build with emulation support" ON)
-option(NS3_TAP "Build with Tap support" ON)
-option(NS3_DPDK "Enable fd-net-device DPDK features" OFF)
-
-# maintenance and documentation
-option(NS3_CLANG_FORMAT "Enforce cody style with clang-format" OFF)
-option(NS3_CLANG_TIDY "Use clang-tidy static analysis" OFF)
-option(NS3_CLANG_TIDY_FIX
-       "Use clang-tidy static analysis and apply automatic fixes" OFF
+# Conditionally link to the point-to-point, point-to-point-layout, and
+# applications modules (needed by tcp-bbr-v3-topology-test.cc, which builds
+# real network topologies with BulkSend/PacketSink traffic to validate
+# BBRv3's behavior).
+set(bbr_v3_topology_test_lib)
+set(bbr_v3_topology_test_sources)
+if(point-to-point
+   IN_LIST
+   ns3-all-enabled-modules
+   AND point-to-point-layout
+       IN_LIST
+       ns3-all-enabled-modules
+   AND applications
+       IN_LIST
+       ns3-all-enabled-modules
 )
-option(NS3_CLANG_TIMETRACE
-       "Collect compilation statistics to analyze the build process" OFF
-)
-option(
-  NS3_CLANGCL_STLCHECKS
-  "Redirect MSVC CRT debug reports (e.g. checked-iterator assertions) to stderr with a stack trace instead of a message box; only effective in debug builds with MSVC-compatible toolchains (cl, clang-cl)"
-  OFF
-)
-option(NS3_COLORED_OUTPUT "Colorize CMake messages" OFF)
-option(NS3_COVERAGE "Enable code coverage measurements and report generation"
-       OFF
-)
-option(NS3_COVERAGE_ZERO_COUNTERS
-       "Zero lcov counters before running. Requires NS3_COVERAGE=ON" OFF
-)
-option(NS3_INCLUDE_WHAT_YOU_USE
-       "Use IWYU to determine unnecessary headers included" OFF
-)
-option(NS3_LINK_WHAT_YOU_USE
-       "Use LWYU to determine unnecessary linked libraries" OFF
-)
-option(NS3_SANITIZE "Build with address, leak and undefined sanitizers" OFF)
-option(NS3_SANITIZE_MEMORY "Build with memory sanitizer" OFF)
-
-# 3rd-party libraries/programs
-option(NS3_NETANIM "Build netanim" OFF)
-
-# other options
-option(NS3_ENABLE_BUILD_VERSION "Embed version info into libraries" OFF)
-option(NS3_CCACHE "Use Ccache to speed up recompilation" ON)
-option(NS3_CPM "Enable the CPM C++ library manager support" OFF)
-option(NS3_FAST_LINKERS "Use Mold or LLD to speed up linking if available" ON)
-option(NS3_FETCH_OPTIONAL_COMPONENTS
-       "Fetch Brite, Click and Openflow dependencies" OFF
-)
-option(
-  NS3_FORCE_LOCAL_DEPENDENCIES
-  "Only search applications, headers, libraries on explicitly set directories"
-  OFF
-)
-option(NS3_GSL "Build with GSL support" ON)
-option(NS3_GTK3 "Build with GTK3 support" ON)
-option(NS3_LINK_TIME_OPTIMIZATION "Build with link-time optimization" OFF)
-option(NS3_MONOLIB
-       "Build a single shared ns-3 library and link it against executables" OFF
-)
-option(NS3_MPI "Build with MPI support" OFF)
-option(NS3_NATIVE_OPTIMIZATIONS "Build with -march=native -mtune=native" OFF)
-option(
-  NS3_NINJA_TRACING
-  "Use ninjatracing to convert Ninja's build log to the about://tracing format"
-  OFF
-)
-set(NS3_OUTPUT_DIRECTORY "" CACHE STRING "Directory to store built artifacts")
-option(NS3_PRECOMPILE_HEADERS
-       "Precompile module headers to speed up compilation" ON
-)
-option(NS3_PYTHON_BINDINGS "Build ns-3 python bindings" OFF)
-option(NS3_SQLITE "Build with SQLite support" ON)
-option(NS3_EIGEN "Build with Eigen support" ON)
-option(NS3_STATIC "Build a static ns-3 library and link it against executables"
-       OFF
-)
-option(NS3_VCPKG "Enable the Vcpkg C++ library manager support" OFF)
-option(NS3_VERBOSE "Print additional build system messages" OFF)
-option(NS3_VISUALIZER "Build visualizer module" ON)
-option(NS3_WARNINGS "Enable compiler warnings" ON)
-option(NS3_WARNINGS_AS_ERRORS
-       "Treat warnings as errors. Requires NS3_WARNINGS=ON" ON
-)
-
-# Options that either select which modules will get built or disable modules
-set(NS3_ENABLED_MODULES ""
-    CACHE STRING "List of modules to enable (e.g. core;network;internet)"
-)
-set(NS3_DISABLED_MODULES "" CACHE STRING
-                                  "List of modules to disable (e.g. lte;wifi)"
-)
-
-# Filter in the modules from which examples and tests will be built
-set(NS3_FILTER_MODULE_EXAMPLES_AND_TESTS
-    ""
-    CACHE
-      STRING
-      "List of modules that should have their examples and tests built (e.g. lte;wifi)"
-)
-
-# Include macros used below
-include(build-support/macros-and-definitions.cmake)
-
-# Scan module libraries
-subdirlist(libs_to_build ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-# Scan contribution libraries
-subdirlist(contrib_libs_to_build ${CMAKE_CURRENT_SOURCE_DIR}/contrib)
-
-# Scan for additional contribution libraries OUTSIDE the ns-3 source directory,
-# in the ns-3-external-contrib directory
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../ns-3-external-contrib)
-  subdirlist(
-    external_contrib_libs_to_build
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ns-3-external-contrib
+  set(bbr_v3_topology_test_lib
+      ${libpoint-to-point} ${libpoint-to-point-layout} ${libapplications}
   )
-  set(contrib_libs_to_build ${contrib_libs_to_build}
-                            ${external_contrib_libs_to_build}
+  set(bbr_v3_topology_test_sources
+      test/tcp-bbr-v3-topology-test.cc
   )
 endif()
 
-# Before filtering, we need to load settings from .ns3rc
-parse_ns3rc(
-  ns3rc_enabled_modules ns3rc_disabled_modules ns3rc_examples_enabled
-  ns3rc_tests_enabled
+set(source_files
+    helper/internet-stack-helper.cc
+    helper/internet-trace-helper.cc
+    helper/ipv4-address-helper.cc
+    helper/ipv4-global-routing-helper.cc
+    helper/ipv6-global-routing-helper.cc
+    helper/ipv4-interface-container.cc
+    helper/ipv4-list-routing-helper.cc
+    helper/ipv4-routing-helper.cc
+    helper/ipv4-static-routing-helper.cc
+    helper/ipv6-address-helper.cc
+    helper/ipv6-interface-container.cc
+    helper/ipv6-list-routing-helper.cc
+    helper/ipv6-routing-helper.cc
+    helper/ipv6-static-routing-helper.cc
+    helper/neighbor-cache-helper.cc
+    helper/rip-helper.cc
+    helper/ripng-helper.cc
+    model/arp-cache.cc
+    model/arp-header.cc
+    model/arp-l3-protocol.cc
+    model/arp-queue-disc-item.cc
+    model/candidate-queue.cc
+    model/global-route-manager-impl.cc
+    model/global-route-manager.cc
+    model/global-router-interface.cc
+    model/icmpv4-l4-protocol.cc
+    model/icmpv4.cc
+    model/icmpv6-header.cc
+    model/icmpv6-l4-protocol.cc
+    model/ip-l4-protocol.cc
+    model/ipv4-address-generator.cc
+    model/ipv4-end-point-demux.cc
+    model/ipv4-end-point.cc
+    model/global-routing.cc
+    model/ipv4-header.cc
+    model/ipv4-interface-address.cc
+    model/ipv4-interface.cc
+    model/ipv4-l3-protocol.cc
+    model/ipv4-list-routing.cc
+    model/ipv4-packet-filter.cc
+    model/ipv4-packet-info-tag.cc
+    model/ipv4-packet-probe.cc
+    model/ipv4-queue-disc-item.cc
+    model/ipv4-raw-socket-factory-impl.cc
+    model/ipv4-raw-socket-factory.cc
+    model/ipv4-raw-socket-impl.cc
+    model/ipv4-route.cc
+    model/ipv4-routing-protocol.cc
+    model/ipv4-routing-table-entry.cc
+    model/ipv4-static-routing.cc
+    model/ipv4.cc
+    model/ipv6-address-generator.cc
+    model/ipv6-autoconfigured-prefix.cc
+    model/ipv6-end-point-demux.cc
+    model/ipv6-end-point.cc
+    model/ipv6-extension-demux.cc
+    model/ipv6-extension-header.cc
+    model/ipv6-extension.cc
+    model/ipv6-header.cc
+    model/ipv6-interface-address.cc
+    model/ipv6-interface.cc
+    model/ipv6-l3-protocol.cc
+    model/ipv6-list-routing.cc
+    model/ipv6-option-demux.cc
+    model/ipv6-option-header.cc
+    model/ipv6-option.cc
+    model/ipv6-packet-filter.cc
+    model/ipv6-packet-info-tag.cc
+    model/ipv6-packet-probe.cc
+    model/ipv6-pmtu-cache.cc
+    model/ipv6-queue-disc-item.cc
+    model/ipv6-raw-socket-factory-impl.cc
+    model/ipv6-raw-socket-factory.cc
+    model/ipv6-raw-socket-impl.cc
+    model/ipv6-route.cc
+    model/ipv6-routing-protocol.cc
+    model/ipv6-routing-table-entry.cc
+    model/ipv6-static-routing.cc
+    model/ipv6.cc
+    model/loopback-net-device.cc
+    model/ndisc-cache.cc
+    model/rip-header.cc
+    model/rip.cc
+    model/ripng-header.cc
+    model/ripng.cc
+    model/rtt-estimator.cc
+    model/tcp-bbr.cc
+    model/tcp-bbr-v3.cc
+    model/tcp-bic.cc
+    model/tcp-congestion-ops.cc
+    model/tcp-cubic.cc
+    model/tcp-dctcp.cc
+    model/tcp-header.cc
+    model/tcp-highspeed.cc
+    model/tcp-htcp.cc
+    model/tcp-hybla.cc
+    model/tcp-illinois.cc
+    model/tcp-l4-protocol.cc
+    model/tcp-ledbat.cc
+    model/tcp-linux-reno.cc
+    model/tcp-lp.cc
+    model/tcp-option-rfc793.cc
+    model/tcp-option-sack-permitted.cc
+    model/tcp-option-sack.cc
+    model/tcp-option-ts.cc
+    model/tcp-option-winscale.cc
+    model/tcp-option.cc
+    model/tcp-prr-recovery.cc
+    model/tcp-rate-ops.cc
+    model/tcp-recovery-ops.cc
+    model/tcp-rx-buffer.cc
+    model/tcp-scalable.cc
+    model/tcp-socket-base.cc
+    model/tcp-socket-factory-impl.cc
+    model/tcp-socket-factory.cc
+    model/tcp-socket-state.cc
+    model/tcp-socket.cc
+    model/tcp-tx-buffer.cc
+    model/tcp-tx-item.cc
+    model/tcp-vegas.cc
+    model/tcp-veno.cc
+    model/tcp-westwood-plus.cc
+    model/tcp-yeah.cc
+    model/udp-header.cc
+    model/udp-l4-protocol.cc
+    model/udp-socket-factory-impl.cc
+    model/udp-socket-factory.cc
+    model/udp-socket-impl.cc
+    model/udp-socket.cc
 )
 
-# After scanning modules, we can filter enabled and disabled ones
-filter_enabled_and_disabled_modules(
-  libs_to_build contrib_libs_to_build NS3_ENABLED_MODULES NS3_DISABLED_MODULES
-  ns3rc_enabled_modules ns3rc_disabled_modules
+set(header_files
+    helper/internet-stack-helper.h
+    helper/internet-trace-helper.h
+    helper/ipv4-address-helper.h
+    helper/ipv4-global-routing-helper.h
+    helper/ipv6-global-routing-helper.h
+    helper/ipv4-interface-container.h
+    helper/ipv4-list-routing-helper.h
+    helper/ipv4-routing-helper.h
+    helper/ipv4-static-routing-helper.h
+    helper/ipv6-address-helper.h
+    helper/ipv6-interface-container.h
+    helper/ipv6-list-routing-helper.h
+    helper/ipv6-routing-helper.h
+    helper/ipv6-static-routing-helper.h
+    helper/neighbor-cache-helper.h
+    helper/rip-helper.h
+    helper/ripng-helper.h
+    model/arp-cache.h
+    model/arp-header.h
+    model/arp-l3-protocol.h
+    model/arp-queue-disc-item.h
+    model/candidate-queue.h
+    model/global-route-manager-impl.h
+    model/global-route-manager.h
+    model/global-router-interface.h
+    model/icmpv4-l4-protocol.h
+    model/icmpv4.h
+    model/icmpv6-header.h
+    model/icmpv6-l4-protocol.h
+    model/ip-l4-protocol.h
+    model/ipv4-address-generator.h
+    model/ipv4-end-point-demux.h
+    model/ipv4-end-point.h
+    model/global-routing.h
+    model/ipv4-header.h
+    model/ipv4-interface-address.h
+    model/ipv4-interface.h
+    model/ipv4-l3-protocol.h
+    model/ipv4-list-routing.h
+    model/ipv4-packet-filter.h
+    model/ipv4-packet-info-tag.h
+    model/ipv4-packet-probe.h
+    model/ipv4-queue-disc-item.h
+    model/ipv4-raw-socket-factory.h
+    model/ipv4-raw-socket-impl.h
+    model/ipv4-route.h
+    model/ipv4-routing-protocol.h
+    model/ipv4-routing-table-entry.h
+    model/ipv4-static-routing.h
+    model/ipv4.h
+    model/ipv6-address-generator.h
+    model/ipv6-end-point-demux.h
+    model/ipv6-end-point.h
+    model/ipv6-extension-demux.h
+    model/ipv6-extension-header.h
+    model/ipv6-extension.h
+    model/ipv6-header.h
+    model/ipv6-interface-address.h
+    model/ipv6-interface.h
+    model/ipv6-l3-protocol.h
+    model/ipv6-list-routing.h
+    model/ipv6-option-header.h
+    model/ipv6-option.h
+    model/ipv6-packet-filter.h
+    model/ipv6-packet-info-tag.h
+    model/ipv6-packet-probe.h
+    model/ipv6-pmtu-cache.h
+    model/ipv6-queue-disc-item.h
+    model/ipv6-raw-socket-factory.h
+    model/ipv6-route.h
+    model/ipv6-routing-protocol.h
+    model/ipv6-routing-table-entry.h
+    model/ipv6-static-routing.h
+    model/ipv6.h
+    model/loopback-net-device.h
+    model/ndisc-cache.h
+    model/rip-header.h
+    model/rip.h
+    model/ripng-header.h
+    model/ripng.h
+    model/rtt-estimator.h
+    model/tcp-bbr.h
+    model/tcp-bbr-v3.h
+    model/tcp-bic.h
+    model/tcp-congestion-ops.h
+    model/tcp-cubic.h
+    model/tcp-dctcp.h
+    model/tcp-header.h
+    model/tcp-highspeed.h
+    model/tcp-htcp.h
+    model/tcp-hybla.h
+    model/tcp-illinois.h
+    model/tcp-l4-protocol.h
+    model/tcp-ledbat.h
+    model/tcp-linux-reno.h
+    model/tcp-lp.h
+    model/tcp-option-rfc793.h
+    model/tcp-option-sack-permitted.h
+    model/tcp-option-sack.h
+    model/tcp-option-ts.h
+    model/tcp-option-winscale.h
+    model/tcp-option.h
+    model/tcp-prr-recovery.h
+    model/tcp-rate-ops.h
+    model/tcp-recovery-ops.h
+    model/tcp-rx-buffer.h
+    model/tcp-scalable.h
+    model/tcp-socket-base.h
+    model/tcp-socket-factory.h
+    model/tcp-socket-state.h
+    model/tcp-socket.h
+    model/tcp-tx-buffer.h
+    model/tcp-tx-item.h
+    model/tcp-vegas.h
+    model/tcp-veno.h
+    model/tcp-westwood-plus.h
+    model/tcp-yeah.h
+    model/udp-header.h
+    model/udp-l4-protocol.h
+    model/udp-socket-factory.h
+    model/udp-socket.h
+    model/windowed-filter.h
 )
 
-if(${NS3_CCACHE})
-  # Use ccache if available
-  mark_as_advanced(CCACHE)
-  find_program(CCACHE ccache)
-  if(NOT ("${CCACHE}" STREQUAL "CCACHE-NOTFOUND"))
-    message(STATUS "CCache is enabled.")
-    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE})
-    execute_process(
-      COMMAND
-        ${CCACHE} --set-config
-        sloppiness=pch_defines,time_macros,include_file_mtime,include_file_ctime
-    )
-    if(DEFINED MSVC)
-      if(MSVC)
-        file(COPY_FILE ${CCACHE} ${CMAKE_BINARY_DIR}/clang-cl.exe
-             ONLY_IF_DIFFERENT
-        )
-        set(CMAKE_VS_GLOBALS
-            "CLToolExe=clang-cl.exe" "CLToolPath=${CMAKE_BINARY_DIR}"
-            "TrackFileAccess=false" "UseMultiToolTask=true"
-            "DebugInformationFormat=OldStyle"
-        )
-      endif()
-    endif()
-  endif()
+set(private_header_files)
+if(WIN32)
+  set(private_header_files
+      model/win32-internet.h
+  )
 endif()
 
-# ##############################################################################
-# Process options                     #
-# ##############################################################################
-process_options()
+set(test_sources
+    test/global-route-manager-impl-test-suite.cc
+    test/icmp-checksum-test-suite.cc
+    test/icmp-test.cc
+    test/internet-stack-helper-test-suite.cc
+    test/ipv4-address-generator-test-suite.cc
+    test/ipv4-address-helper-test-suite.cc
+    test/ipv4-deduplication-test.cc
+    test/ipv4-forwarding-test.cc
+    test/ipv4-fragmentation-test.cc
+    test/global-routing-test-suite.cc
+    test/ipv4-header-test.cc
+    test/ipv4-icmp-no-route-test-suite.cc
+    test/ipv4-list-routing-test-suite.cc
+    test/ipv4-packet-info-tag-test-suite.cc
+    test/ipv4-raw-test.cc
+    test/ipv4-rip-test.cc
+    test/ipv4-static-routing-test-suite.cc
+    test/ipv4-test.cc
+    test/ipv6-address-duplication-test.cc
+    test/ipv6-address-generator-test-suite.cc
+    test/ipv6-address-helper-test-suite.cc
+    test/ipv6-dual-stack-test-suite.cc
+    test/ipv6-extension-header-test-suite.cc
+    test/ipv6-forwarding-test.cc
+    test/ipv6-fragmentation-test.cc
+    test/ipv6-list-routing-test-suite.cc
+    test/ipv6-packet-info-tag-test-suite.cc
+    test/ipv6-raw-test.cc
+    test/ipv6-ripng-test.cc
+    test/ipv6-test.cc
+    test/neighbor-cache-test.cc
+    test/rtt-test.cc
+    test/tcp-abe-test.cc
+    test/tcp-advertised-window-test.cc
+    test/tcp-bbr-test.cc
+    test/tcp-bbr-v3-test.cc
+    test/tcp-bic-test.cc
+    test/tcp-bytes-in-flight-test.cc
+    test/tcp-classic-recovery-test.cc
+    test/tcp-close-test.cc
+    test/tcp-cong-avoid-test.cc
+    test/tcp-datasentcb-test.cc
+    test/tcp-dctcp-loss-test-suite.cc
+    test/tcp-dctcp-test.cc
+    test/tcp-ecn-test.cc
+    test/tcp-endpoint-bug2211.cc
+    test/tcp-error-model.cc
+    test/tcp-fack-test.cc
+    test/tcp-fast-retr-test.cc
+    test/tcp-general-test.cc
+    test/tcp-header-test.cc
+    test/tcp-highspeed-test.cc
+    test/tcp-htcp-test.cc
+    test/tcp-hybla-test.cc
+    test/tcp-illinois-test.cc
+    test/tcp-ledbat-test.cc
+    test/tcp-linux-reno-test.cc
+    test/tcp-loss-test.cc
+    test/tcp-lp-test.cc
+    test/tcp-option-test.cc
+    test/tcp-pacing-test.cc
+    test/tcp-pkts-acked-test.cc
+    test/tcp-prr-recovery-test.cc
+    test/tcp-rate-ops-test.cc
+    test/tcp-rto-test.cc
+    test/tcp-rtt-estimation.cc
+    test/tcp-rx-buffer-test.cc
+    test/tcp-sack-permitted-test.cc
+    test/tcp-scalable-test.cc
+    test/tcp-slow-start-test.cc
+    test/tcp-syn-connection-failed-test.cc
+    test/tcp-test.cc
+    test/tcp-timestamp-test.cc
+    test/tcp-tx-buffer-test.cc
+    test/tcp-vegas-test.cc
+    test/tcp-veno-test.cc
+    test/tcp-window-update-test-suite.cc
+    test/tcp-wscaling-test.cc
+    test/tcp-yeah-test.cc
+    test/tcp-zero-window-test.cc
+    test/udp-test.cc
+    ${bbr_v3_topology_test_sources}
+)
 
-# ##############################################################################
-# Add subdirectories                  #
-# ##############################################################################
-# Build NS3 library core
-add_subdirectory(src)
-
-# Build NS library examples
-add_subdirectory(examples)
-
-# Build scratch/simulation scripts
-add_subdirectory(scratch)
-
-# Build test utils
-add_subdirectory(utils)
-
-write_lock()
-write_configtable()
-
-# Export package targets when installing
-ns3_cmake_package()
+build_lib(
+  LIBNAME internet
+  SOURCE_FILES ${source_files}
+  HEADER_FILES ${header_files}
+  PRIVATE_HEADER_FILES ${private_header_files}
+  LIBRARIES_TO_LINK ${libbridge}
+                    ${libtraffic-control}
+  TEST_SOURCES ${test_sources}
+  TEST_LIBRARIES_TO_LINK ${bbr_v3_topology_test_lib}
+  GENERATE_EXPORT_HEADER
+)
