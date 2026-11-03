@@ -130,7 +130,7 @@ TcpBbrV3CheckGainValuesTest::ExecuteTest()
         break;
     case TcpBbrV3::BBR_DRAIN:
         cong->EnterDrain();
-        desiredPacingGain = 1.0 / 2.885;
+        desiredPacingGain = 0.5;
         desiredCwndGain = 2.0;
         break;
     case TcpBbrV3::BBR_PROBE_RTT:
@@ -212,7 +212,7 @@ TcpBbrV3ProbeBwSubStateTest::ExecuteTest()
     switch (m_phase)
     {
     case TcpBbrV3::BBR_BW_PROBE_DOWN:
-        desiredPacingGain = 0.91;
+        desiredPacingGain = 0.90;
         break;
     case TcpBbrV3::BBR_BW_PROBE_REFILL:
         cong->StartBwProbeRefill(0);
@@ -342,7 +342,7 @@ class TcpBbrV3TestSuite : public TestSuite
             new TcpBbrV3CheckGainValuesTest(
                 TcpBbrV3::BBR_DRAIN,
                 2.77,
-                "BBRv3 should enter DRAIN with pacing gain 1/2.885 and cwnd gain 2"),
+                "BBRv3 should enter DRAIN with pacing gain 0.5 and cwnd gain 2"),
             TestCase::Duration::QUICK);
         AddTestCase(
             new TcpBbrV3CheckGainValuesTest(TcpBbrV3::BBR_PROBE_RTT,

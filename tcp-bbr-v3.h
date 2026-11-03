@@ -43,7 +43,7 @@ class TcpBbrV3 : public TcpCongestionOps
      */
     static const uint8_t GAIN_CYCLE_LENGTH = 4;
 
-    /** @brief PROBE_BW pacing gain per sub-state. Linux: bbr_pacing_gain[]. */
+    /** @brief PROBE_BW pacing gain per sub-state (DOWN is replaced by ProbeBwDownGain). */
     const static double PACING_GAIN_CYCLE[];
 
     /**
@@ -240,7 +240,10 @@ class TcpBbrV3 : public TcpCongestionOps
     Ptr<UniformRandomVariable> m_uv; //!< Rand, used for randomized bw-probe timing
     double m_highGain{0};            //!< STARTUP pacing gain (HighGain attribute)
     double m_startupCwndGain{2.0};   //!< STARTUP/DRAIN cwnd gain. Linux: bbr_startup_cwnd_gain.
-    double m_drainGain{1.0 / 2.885}; //!< DRAIN pacing gain. Linux: bbr_drain_gain.
+    double m_drainGain{0.5};         //!< DRAIN pacing gain (DrainGain attribute)
+    double m_probeBwDownGain{0.90};  //!< PROBE_BW DOWN pacing gain (ProbeBwDownGain attribute)
+    uint32_t m_drainMaxRounds{3};    //!< Max rounds in DRAIN; 0 = unbounded (DrainMaxRounds attribute)
+    uint32_t m_drainStartRound{0};   //!< m_roundCount when DRAIN was entered
 
     static const char* const BbrModeName[BBR_PROBE_RTT + 1]; //!< Names for BbrMode_t, for logging
 
@@ -322,7 +325,7 @@ class TcpBbrV3 : public TcpCongestionOps
     uint32_t m_extraAckedGain{1};                 //!< Gain factor for adding extra ack to cwnd
     uint32_t m_extraAcked[2]{0, 0};               //!< Maximum excess data acked in epoch
     uint32_t m_extraAckedWinRtt{0};               //!< Age of extra acked in rtt
-    uint32_t m_extraAckedWinRttLength{5};         //!< Window length of extra acked window
+    uint32_t m_extraAckedWinRttLength{10};        //!< Rounds per extra_acked filter slot (ExtraAckedRtts attribute)
     uint32_t m_ackEpochAckedResetThresh{1 << 17}; //!< Max allowed m_ackEpochAcked, in bytes
     uint32_t m_extraAckedIdx{0};                  //!< Current index in extra acked array
     Time m_ackEpochTime;                          //!< Starting of ACK sampling epoch time

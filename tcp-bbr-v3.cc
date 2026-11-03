@@ -12,7 +12,8 @@ namespace ns3
 NS_LOG_COMPONENT_DEFINE("TcpBbrV3");
 NS_OBJECT_ENSURE_REGISTERED(TcpBbrV3);
 
-const double TcpBbrV3::PACING_GAIN_CYCLE[] = {1.25, 0.91, 1.0, 1.0}; // Linux: bbr_pacing_gain[]
+// DOWN is overridden by the ProbeBwDownGain attribute (draft-ietf-ccwg-bbr-06: 0.90, Linux: 0.91)
+const double TcpBbrV3::PACING_GAIN_CYCLE[] = {1.25, 0.90, 1.0, 1.0};
 
 const char* const TcpBbrV3::BbrModeName[BBR_PROBE_RTT + 1] = {
     "BBR_STARTUP",
@@ -44,6 +45,28 @@ TcpBbrV3::GetTypeId()
                           DoubleValue(2.77),
                           MakeDoubleAccessor(&TcpBbrV3::m_highGain),
                           MakeDoubleChecker<double>())
+            .AddAttribute("DrainGain",
+                          "DRAIN pacing gain (draft-ietf-ccwg-bbr-06: 0.5; Linux: 1/2.885)",
+                          DoubleValue(0.5),
+                          MakeDoubleAccessor(&TcpBbrV3::m_drainGain),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("ProbeBwDownGain",
+                          "PROBE_BW DOWN pacing gain (draft-ietf-ccwg-bbr-06: 0.90; Linux: 0.91)",
+                          DoubleValue(0.90),
+                          MakeDoubleAccessor(&TcpBbrV3::m_probeBwDownGain),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("DrainMaxRounds",
+                          "Rounds after which DRAIN exits even if inflight is still above the "
+                          "BDP; 0 disables the bound (draft-ietf-ccwg-bbr-06: 3; Linux: none)",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&TcpBbrV3::m_drainMaxRounds),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("ExtraAckedRtts",
+                          "Rounds per slot of the two-slot extra_acked max filter "
+                          "(draft-ietf-ccwg-bbr-06 ExtraAckedFilterLen: 10; Linux: 5)",
+                          UintegerValue(10),
+                          MakeUintegerAccessor(&TcpBbrV3::m_extraAckedWinRttLength),
+                          MakeUintegerChecker<uint32_t>(1, 31))
             .AddAttribute("Stream",
                           "Random number stream (default is set to 4 to align with Linux results)",
                           UintegerValue(4),
@@ -96,6 +119,9 @@ TcpBbrV3::TcpBbrV3(const TcpBbrV3& sock)
       m_highGain(sock.m_highGain),
       m_startupCwndGain(sock.m_startupCwndGain),
       m_drainGain(sock.m_drainGain),
+      m_probeBwDownGain(sock.m_probeBwDownGain),
+      m_drainMaxRounds(sock.m_drainMaxRounds),
+      m_drainStartRound(sock.m_drainStartRound),
       m_delivered(sock.m_delivered),
       m_probeRttDoneStamp(sock.m_probeRttDoneStamp),
       m_idleRestart(sock.m_idleRestart),
@@ -229,6 +255,7 @@ TcpBbrV3::EnterDrain()
     SetBbrState(BbrMode_t::BBR_DRAIN);
     m_pacingGain = m_drainGain;
     m_cWndGain = m_startupCwndGain;
+    m_drainStartRound = m_roundCount;
 }
 
 void
@@ -253,7 +280,7 @@ TcpBbrV3::StartBwProbeDown()
     m_cycleStamp = Simulator::Now();
     m_ackPhase = BBR_ACKS_PROBE_STOPPING;
     m_nextRoundDelivered = m_delivered;
-    m_pacingGain = PACING_GAIN_CYCLE[BBR_BW_PROBE_DOWN];
+    m_pacingGain = m_probeBwDownGain;
     m_cWndGain = 2;
     SetCycleIdx(BBR_BW_PROBE_DOWN);
 }
@@ -1362,7 +1389,11 @@ TcpBbrV3::CheckDrain(Ptr<TcpSocketState> tcb)
         tcb->m_ssThresh = InFlight(tcb, MaxBw(), 1);
         ResetCongestionSignals();
     }
-    if (m_state == BbrMode_t::BBR_DRAIN && tcb->m_bytesInFlight <= InFlight(tcb, MaxBw(), 1))
+    // The round bound (draft-ietf-ccwg-bbr-06 CheckDrainDone()) keeps an
+    // overestimated STARTUP bw from holding the flow in DRAIN indefinitely.
+    if (m_state == BbrMode_t::BBR_DRAIN &&
+        (tcb->m_bytesInFlight <= InFlight(tcb, MaxBw(), 1) ||
+         (m_drainMaxRounds > 0 && m_roundCount > m_drainStartRound + m_drainMaxRounds)))
     {
         EnterProbeBW();
     }
