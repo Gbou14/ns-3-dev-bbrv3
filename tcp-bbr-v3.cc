@@ -6,6 +6,8 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 
+#include <limits>
+
 namespace ns3
 {
 
@@ -1310,7 +1312,6 @@ TcpBbrV3::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRat
     NS_LOG_FUNCTION(this << tcb << rs);
     uint32_t expectedAcked;
     uint32_t extraAck;
-    uint32_t epochProp;
     if (!m_extraAckedGain || rs.m_ackedSacked <= 0 || rs.m_delivered < 0)
     {
         return;
@@ -1318,18 +1319,27 @@ TcpBbrV3::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRat
     if (m_roundStart)
     {
         m_extraAckedWinRtt = std::min<uint32_t>(31, m_extraAckedWinRtt + 1);
-        if (m_extraAckedWinRtt >= m_extraAckedWinRttLength)
+        // As in Linux, STARTUP keeps only the last round's aggregation, so
+        // the larger excess seen while the bw estimate is still ramping up is
+        // not carried into PROBE_BW.
+        uint32_t winRttThresh = m_isPipeFilled ? m_extraAckedWinRttLength : 1;
+        if (m_extraAckedWinRtt >= winRttThresh)
         {
             m_extraAckedWinRtt = 0;
             m_extraAckedIdx = m_extraAckedIdx ? 0 : 1;
             m_extraAcked[m_extraAckedIdx] = 0;
         }
     }
-    epochProp = Simulator::Now().GetSeconds() - m_ackEpochTime.GetSeconds();
     // Linux's bbr_update_ack_aggregation() uses bbr_bw() (loss-bound
     // capped), not bbr_max_bw() -- same Bw()/MaxBw() split as
-    // SetPacingRate().
-    expectedAcked = Bw().GetBitRate() * epochProp / 8;
+    // SetPacingRate(). The epoch must keep sub-second resolution: truncating
+    // it to whole seconds makes expectedAcked 0 for the first second of every
+    // epoch, so all ACKed data counts as aggregation and pads cwnd by a full
+    // extra BDP.
+    Time epoch = Simulator::Now() - m_ackEpochTime;
+    expectedAcked = static_cast<uint32_t>(
+        std::min<double>(Bw().GetBitRate() * epoch.GetSeconds() / 8.0,
+                         std::numeric_limits<uint32_t>::max()));
     if (m_ackEpochAcked <= expectedAcked ||
         (m_ackEpochAcked + rs.m_ackedSacked >= m_ackEpochAckedResetThresh))
     {
