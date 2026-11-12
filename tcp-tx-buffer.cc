@@ -76,6 +76,16 @@ TcpTxBuffer::HeadSequence() const
     return m_firstByteSeq;
 }
 
+Time
+TcpTxBuffer::HeadSentTime() const
+{
+    if (m_sentList.empty())
+    {
+        return Seconds(-1);
+    }
+    return m_sentList.front()->GetLastSent();
+}
+
 SequenceNumber32
 TcpTxBuffer::TailSequence() const
 {

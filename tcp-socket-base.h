@@ -1081,6 +1081,18 @@ class TcpSocketBase : public TcpSocket
     virtual uint32_t AvailableWindow() const;
 
     /**
+     * @brief Decide whether to hold back a partial burst of new data, as
+     * Linux's tcp_tso_should_defer() holds back a TSO skb smaller than its
+     * full size until more ACKs arrive. Only used with a send quantum larger
+     * than one segment.
+     *
+     * @param limit bytes the window lets out now
+     * @param quantum full burst size, in bytes
+     * @return true if the burst should wait
+     */
+    bool TsoShouldDefer(uint32_t limit, uint32_t quantum) const;
+
+    /**
      * @brief The amount of Rx window announced to the peer
      * @param scale indicate if the window should be scaled. True for
      * almost all cases, except when we are sending a SYN
@@ -1420,6 +1432,7 @@ class TcpSocketBase : public TcpSocket
     Time m_minRto{Time::Max()};  //!< minimum value of the Retransmit timeout
     bool m_linuxRto{false};      //!< Compute and restart the retransmission timer as Linux does
     bool m_inPacingBurst{false}; //!< SendPendingData() is sending a paced burst
+    Time m_pacingRelease{0}; //!< When the last paced burst's transmission time ends (tcp_wstamp_ns)
     Time m_clockGranularity{Seconds(0.001)}; //!< Clock Granularity used in RTO calcs
     Time m_delAckTimeout;                    //!< Time to delay an ACK
     Time m_persistTimeout;                   //!< Time between sending 1-byte probes

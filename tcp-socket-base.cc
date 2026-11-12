@@ -3348,6 +3348,7 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
             NS_LOG_DEBUG("Timer is in expired state, activate it "
                          << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
             m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
+            m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
         }
         else
         {
@@ -3597,6 +3598,12 @@ TcpSocketBase::SendPendingData(bool withAck)
             {
                 break;
             }
+            if (burstBytes == 0 && !isRetx && quantum > m_tcb->m_segmentSize && IsPacingEnabled() &&
+                TsoShouldDefer(availableWindow, quantum))
+            {
+                NS_LOG_LOGIC("Deferring a partial burst of " << availableWindow << " bytes");
+                break;
+            }
 
             // It's time to transmit, but before do silly window and Nagle's check
             uint32_t availableData = m_txBuffer->SizeFromSequence(next);
@@ -3672,6 +3679,7 @@ TcpSocketBase::SendPendingData(bool withAck)
                                  << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
                     m_pacingTimer.Schedule(
                         m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
+                    m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
                     burstBytes = 0;
                     break;
                 }
@@ -3695,6 +3703,7 @@ TcpSocketBase::SendPendingData(bool withAck)
         // A burst cut short by the window or the data still waits for its own
         // transmission time.
         m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
+        m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
     }
 
     if (nPacketsSent > 0)
@@ -3739,6 +3748,46 @@ uint32_t
 TcpSocketBase::Window() const
 {
     return std::min(m_rWnd.Get(), m_tcb->m_cWnd.Get());
+}
+
+bool
+TcpSocketBase::TsoShouldDefer(uint32_t limit, uint32_t quantum) const
+{
+    // Linux tcp_tso_should_defer(), tcp_output.c. The skb-tail test is left
+    // out: a bulk sender's queued skb is already a full burst, so it is the
+    // same as the full-burst test.
+    if (m_tcb->m_congState >= TcpSocketState::CA_RECOVERY)
+    {
+        return false;
+    }
+    // Defer only if the last burst was recent (tcp_wstamp_ns within 1 ms).
+    Time now = Simulator::Now();
+    if (now - m_pacingRelease > MilliSeconds(1))
+    {
+        return false;
+    }
+    if (limit >= quantum)
+    {
+        return false;
+    }
+    // tcp_tso_win_divisor (3): send if a third of the window is available.
+    uint32_t chunk = std::min<uint32_t>(m_rWnd.Get(), m_tcb->m_cWnd.Get()) / 3;
+    if (limit >= chunk)
+    {
+        return false;
+    }
+    // If the next ACK is likely to come too late (half srtt), do not defer.
+    Time head = m_txBuffer->HeadSentTime();
+    if (head.IsNegative() || now - head < m_tcb->m_srtt.Get() / 2)
+    {
+        return false;
+    }
+    // A FIN would follow this data, so it will get no more: do not wait.
+    if (m_closeOnEmpty && m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence) <= limit)
+    {
+        return false;
+    }
+    return true;
 }
 
 uint32_t

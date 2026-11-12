@@ -140,6 +140,12 @@ class TcpTxBuffer : public Object
     SequenceNumber32 TailSequence() const;
 
     /**
+     * @brief Get when the oldest sent, unacknowledged segment was last sent
+     * @returns its last transmission time, or a negative time if none is outstanding
+     */
+    Time HeadSentTime() const;
+
+    /**
      * @brief Returns total number of bytes in this buffer
      * @returns total number of bytes in this Tx buffer
      */
