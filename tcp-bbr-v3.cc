@@ -1380,7 +1380,9 @@ TcpBbrV3::AckAggregationCwnd()
     NS_LOG_FUNCTION(this);
     uint32_t maxAggrBytes; // MaxBW * 0.1 secs
     uint32_t aggrCwndBytes = 0;
-    if (m_extraAckedGain && m_isPipeFilled)
+    // Linux v3's bbr_ack_aggregation_cwnd() applies in STARTUP too; v1 only
+    // after the pipe was filled.
+    if (m_extraAckedGain)
     {
         maxAggrBytes = Bw().GetBitRate() / (10 * 8);
         aggrCwndBytes = m_extraAckedGain * std::max(m_extraAcked[0], m_extraAcked[1]);
