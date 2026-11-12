@@ -3348,7 +3348,7 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
             NS_LOG_DEBUG("Timer is in expired state, activate it "
                          << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
             m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-            m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+            m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
         }
         else
         {
@@ -3547,8 +3547,9 @@ TcpSocketBase::SendPendingData(bool withAck)
     uint32_t burstBytes = 0;
     uint32_t quantum = std::max<uint32_t>(m_tcb->m_sendQuantum, 1);
     m_inPacingBurst = IsPacingEnabled();
-    bool burstRetx = false;    // the burst so far carries retransmitted data
-    SequenceNumber32 burstEnd; // sequence after the burst so far
+    bool deferredForCwnd = false; // TSO deferral waited for cwnd (Linux is_cwnd_limited)
+    bool burstRetx = false;       // the burst so far carries retransmitted data
+    SequenceNumber32 burstEnd;    // sequence after the burst so far
 
     // RFC 6675, Section (C)
     // If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
@@ -3602,6 +3603,7 @@ TcpSocketBase::SendPendingData(bool withAck)
                 TsoShouldDefer(availableWindow, quantum))
             {
                 NS_LOG_LOGIC("Deferring a partial burst of " << availableWindow << " bytes");
+                deferredForCwnd = m_tcb->m_cWnd.Get() < m_rWnd.Get();
                 break;
             }
 
@@ -3679,7 +3681,7 @@ TcpSocketBase::SendPendingData(bool withAck)
                                  << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
                     m_pacingTimer.Schedule(
                         m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
-                    m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+                    m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
                     burstBytes = 0;
                     break;
                 }
@@ -3698,12 +3700,14 @@ TcpSocketBase::SendPendingData(bool withAck)
     }
 
     m_inPacingBurst = false;
+    CwndValidate(deferredForCwnd || m_tcb->m_cWnd < BytesInFlight() + m_tcb->m_segmentSize,
+                 nPacketsSent > 0);
     if (burstBytes > 0 && m_pacingTimer.IsExpired())
     {
         // A burst cut short by the window or the data still waits for its own
         // transmission time.
         m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
-        m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+        m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
     }
 
     if (nPacketsSent > 0)
@@ -3762,7 +3766,7 @@ TcpSocketBase::TsoShouldDefer(uint32_t limit, uint32_t quantum) const
     }
     // Defer only if the last burst was recent (tcp_wstamp_ns within 1 ms).
     Time now = Simulator::Now();
-    if (now - m_pacingRelease > MilliSeconds(1))
+    if (now - m_tcb->m_pacingRelease > MilliSeconds(1))
     {
         return false;
     }
@@ -3788,6 +3792,26 @@ TcpSocketBase::TsoShouldDefer(uint32_t limit, uint32_t quantum) const
         return false;
     }
     return true;
+}
+
+void
+TcpSocketBase::CwndValidate(bool isCwndLimited, bool sent)
+{
+    // Linux tcp_cwnd_validate(), called at the end of tcp_write_xmit(): once
+    // a send is cwnd-limited, that holds until the window of data sent so
+    // far is acknowledged; otherwise track the most data outstanding.
+    if (!sent && !isCwndLimited)
+    {
+        return;
+    }
+    uint32_t out = m_tcb->m_highTxMark.Get() - m_txBuffer->HeadSequence();
+    if (m_txBuffer->HeadSequence() >= m_cwndUsageSeq || isCwndLimited ||
+        (!m_tcb->m_cwndLimitedInWindow && out > m_maxBytesOut))
+    {
+        m_tcb->m_cwndLimitedInWindow = isCwndLimited;
+        m_maxBytesOut = out;
+        m_cwndUsageSeq = m_tcb->m_highTxMark;
+    }
 }
 
 uint32_t

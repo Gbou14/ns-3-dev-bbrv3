@@ -813,7 +813,7 @@ void
 TcpBbrV3::ProbeInflightHiUpward(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
 {
     NS_LOG_FUNCTION(this << tcb << rs);
-    if (!tcb->m_isCwndLimited || tcb->m_cWnd.Get() < m_inflightHi)
+    if (!tcb->m_cwndLimitedInWindow || tcb->m_cWnd.Get() < m_inflightHi)
     {
         return; // not fully using inflight_hi, so don't grow it
     }
@@ -1089,12 +1089,8 @@ TcpBbrV3::UpdateCyclePhase(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
         return;
     }
 
-    // Linux: bbr_packets_in_net_at_edt(sk, rs->prior_in_flight), i.e. the
-    // data in flight before this ACK, less what the path delivers before the
-    // next departure time scheduled by pacing (EDT). ns-3 paces one segment
-    // at a time and doesn't expose that departure time to congestion
-    // control, so the EDT term (at most about one segment here) is omitted.
-    uint32_t inflight = rs.m_priorInFlight;
+    // Linux: bbr_packets_in_net_at_edt(sk, rs->prior_in_flight).
+    uint32_t inflight = InflightAtEdt(tcb, rs.m_priorInFlight);
     DataRate bw = MaxBw();
 
     switch (m_probeBwPhase)
@@ -1137,7 +1133,7 @@ TcpBbrV3::UpdateCyclePhase(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
             m_stoppedRiskyProbe = true;
             isBwProbeDone = true;
         }
-        else if (tcb->m_isCwndLimited && tcb->m_cWnd.Get() >= m_inflightHi)
+        else if (tcb->m_cwndLimitedInWindow && tcb->m_cWnd.Get() >= m_inflightHi)
         {
             // inflight_hi is limiting bw growth.
             ResetFullBw();
@@ -1492,7 +1488,7 @@ TcpBbrV3::CheckDrain(Ptr<TcpSocketState> tcb)
     // The round bound (draft-ietf-ccwg-bbr-06 CheckDrainDone()) keeps an
     // overestimated STARTUP bw from holding the flow in DRAIN indefinitely.
     if (m_state == BbrMode_t::BBR_DRAIN &&
-        (tcb->m_bytesInFlight <= InFlight(tcb, MaxBw(), 1) ||
+        (InflightAtEdt(tcb, tcb->m_bytesInFlight) <= InFlight(tcb, MaxBw(), 1) ||
          (m_drainMaxRounds > 0 && m_roundCount > m_drainStartRound + m_drainMaxRounds)))
     {
         EnterProbeBW();
@@ -1674,6 +1670,13 @@ TcpBbrV3::SetSendQuantum(Ptr<TcpSocketState> tcb)
         tcb->m_sendQuantum = 0;
         return;
     }
+    m_sendQuantum = TsoSegsGoal(tcb);
+    tcb->m_sendQuantum = m_sendQuantum;
+}
+
+uint32_t
+TcpBbrV3::TsoSegsGoal(Ptr<TcpSocketState> tcb) const
+{
     // Linux: bbr_tso_segs_generic(). About 1 ms of data at the pacing rate
     // (sk_pacing_rate >> sk_pacing_shift, shift 10), plus 64 KB halved for
     // every 2^9 us of min_rtt (tso_rtt_shift 9), capped at the 64 KB GSO
@@ -1689,8 +1692,21 @@ TcpBbrV3::SetSendQuantum(Ptr<TcpSocketState> tcb)
     }
     bytes = std::min<uint64_t>(bytes, 65536 - 1 - 320);
     uint32_t segs = std::max<uint32_t>(bytes / tcb->m_segmentSize, 2);
-    m_sendQuantum = segs * tcb->m_segmentSize;
-    tcb->m_sendQuantum = m_sendQuantum;
+    return segs * tcb->m_segmentSize;
+}
+
+uint32_t
+TcpBbrV3::InflightAtEdt(Ptr<TcpSocketState> tcb, uint32_t inflightNow) const
+{
+    Time now = Simulator::Now();
+    Time interval = std::max(tcb->m_pacingRelease, now) - now;
+    auto delivered = static_cast<uint64_t>(Bw().GetBitRate() * interval.GetSeconds() / 8);
+    uint64_t inflight = inflightNow;
+    if (m_pacingGain > 1)
+    {
+        inflight += TsoSegsGoal(tcb); // the burst sent at the EDT
+    }
+    return delivered >= inflight ? 0 : static_cast<uint32_t>(inflight - delivered);
 }
 
 void

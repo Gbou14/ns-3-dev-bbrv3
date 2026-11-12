@@ -517,6 +517,24 @@ class TcpBbrV3 : public TcpCongestionOps
     uint32_t FloorSegments(uint32_t bytes) const;
 
     /**
+     * @brief Linux bbr_tso_segs_goal(): the TSO/GSO burst size BBR budgets
+     * for, from the pacing rate and min_rtt, at least two segments.
+     * @param tcb the socket state
+     * @return burst size in bytes, a whole number of segments
+     */
+    uint32_t TsoSegsGoal(Ptr<TcpSocketState> tcb) const;
+
+    /**
+     * @brief Linux bbr_packets_in_net_at_edt(): data that will still be in
+     * flight at the next departure time pacing allows (EDT), counting the
+     * burst sent then if the pacing gain is above 1.
+     * @param tcb the socket state
+     * @param inflightNow bytes in flight now
+     * @return estimated bytes in flight at the EDT
+     */
+    uint32_t InflightAtEdt(Ptr<TcpSocketState> tcb, uint32_t inflightNow) const;
+
+    /**
      * @brief Update per-round loss/ECN signals and adjust bw_lo/inflight_lo/hi.
      * Linux: bbr_update_congestion_signals(), plus its callees
      * bbr_loss_lower_bounds(), bbr_ecn_lower_bounds(), bbr_adapt_lower_bounds(),

@@ -198,15 +198,19 @@ class TcpSocketState : public Object
     uint32_t m_sendQuantum{0}; //!< Bytes that may be sent back to back per pacing interval, set
                                //!< by the congestion control (Linux: the TSO/GSO burst from the
                                //!< tso_segs() hook); 0 means one segment
+    Time m_pacingRelease{0};   //!< When pacing next lets data out, i.e. the end of the last paced
+                               //!< transmission time (Linux tcp_wstamp_ns)
 
     Time m_minRtt{Time::Max()}; //!< Minimum RTT observed throughout the connection
 
     TracedValue<uint32_t> m_bytesInFlight{0}; //!< Bytes in flight
     TracedValue<uint32_t> m_fackAwnd{0};      //!< inflight data by FACK
 
-    bool m_isCwndLimited{false}; //!< Whether throughput is limited by cwnd
-    TracedValue<Time> m_srtt;    //!< Smoothed RTT
-    TracedValue<Time> m_lastRtt; //!< RTT of the last (S)ACKed packet
+    bool m_isCwndLimited{false};       //!< Whether throughput is limited by cwnd
+    bool m_cwndLimitedInWindow{false}; //!< Linux tp->is_cwnd_limited: some send in the current
+                                       //!< window of data was limited by cwnd (tcp_cwnd_validate())
+    TracedValue<Time> m_srtt;          //!< Smoothed RTT
+    TracedValue<Time> m_lastRtt;       //!< RTT of the last (S)ACKed packet
 
     Ptr<TcpRxBuffer> m_rxBuffer; //!< Rx buffer (reordering buffer)
 

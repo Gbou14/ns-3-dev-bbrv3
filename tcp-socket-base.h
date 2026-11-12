@@ -1093,6 +1093,15 @@ class TcpSocketBase : public TcpSocket
     bool TsoShouldDefer(uint32_t limit, uint32_t quantum) const;
 
     /**
+     * @brief Track whether the cwnd limited sending in the current window
+     * of data, as Linux's tcp_cwnd_validate() keeps tp->is_cwnd_limited.
+     *
+     * @param isCwndLimited whether this send attempt was limited by cwnd
+     * @param sent whether any data was sent
+     */
+    void CwndValidate(bool isCwndLimited, bool sent);
+
+    /**
      * @brief The amount of Rx window announced to the peer
      * @param scale indicate if the window should be scaled. True for
      * almost all cases, except when we are sending a SYN
@@ -1432,7 +1441,8 @@ class TcpSocketBase : public TcpSocket
     Time m_minRto{Time::Max()};  //!< minimum value of the Retransmit timeout
     bool m_linuxRto{false};      //!< Compute and restart the retransmission timer as Linux does
     bool m_inPacingBurst{false}; //!< SendPendingData() is sending a paced burst
-    Time m_pacingRelease{0}; //!< When the last paced burst's transmission time ends (tcp_wstamp_ns)
+    uint32_t m_maxBytesOut{0};   //!< Most data outstanding in the current window (max_packets_out)
+    SequenceNumber32 m_cwndUsageSeq{0};      //!< End of the current window (cwnd_usage_seq)
     Time m_clockGranularity{Seconds(0.001)}; //!< Clock Granularity used in RTO calcs
     Time m_delAckTimeout;                    //!< Time to delay an ACK
     Time m_persistTimeout;                   //!< Time between sending 1-byte probes
