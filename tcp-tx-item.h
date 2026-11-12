@@ -68,6 +68,12 @@ class TcpTxItem
     const Time& GetLastSent() const;
 
     /**
+     * @brief Get the sequence number just past the end of the item.
+     * @return the start sequence number plus the item size
+     */
+    SequenceNumber32 GetSeqEnd() const;
+
+    /**
      * @brief Various rate-related information, can be accessed by TcpRateOps.
      *
      * Note: This is not enforced through C++, but you developer must honour

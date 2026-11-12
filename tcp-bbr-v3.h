@@ -1,4 +1,4 @@
-//SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only
 
 #ifndef TCPBBRV3_H
 #define TCPBBRV3_H
@@ -98,9 +98,13 @@ class TcpBbrV3 : public TcpCongestionOps
     void CwndEvent(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCAEvent_t event) override;
     uint32_t GetSsThresh(Ptr<const TcpSocketState> tcb, uint32_t bytesInFlight) override;
     bool HasCongControl() const override;
+    void SkbMarkedLost(Ptr<TcpSocketState> tcb,
+                       const TcpTxItem::RateInformation& txInfo,
+                       uint32_t size,
+                       uint64_t totalLost) override;
     void CongControl(Ptr<TcpSocketState> tcb,
-                      const TcpRateOps::TcpRateConnection& rc,
-                      const TcpRateOps::TcpRateSample& rs) override;
+                     const TcpRateOps::TcpRateConnection& rc,
+                     const TcpRateOps::TcpRateSample& rs) override;
 
     /**
      * @brief Accumulates bytes-acked vs. bytes-acked-while-ECN-marked.
@@ -141,6 +145,38 @@ class TcpBbrV3 : public TcpCongestionOps
      * @return the current sub-state.
      */
     BbrProbeBwPhase_t GetProbeBwPhase() const;
+
+    /**
+     * @brief Snapshot of the state Linux exports via INET_DIAG_BBRINFO.
+     *
+     * Same fields as Linux's struct tcp_bbr_info (filled by bbr_get_info()),
+     * in ns-3 units, so ns-3 runs can be compared field by field with
+     * `ss`/sock_diag samples of a Linux BBRv3 sender.
+     */
+    struct BbrInfo
+    {
+        DataRate bw;             //!< bbr_bw(): MaxBw() capped by bw_lo
+        DataRate bwHi;           //!< bbr_max_bw()
+        DataRate bwLo;           //!< bw_lo (maximum DataRate if unset)
+        Time minRtt;             //!< min_rtt
+        double pacingGain;       //!< current pacing gain
+        double cwndGain;         //!< current cwnd gain
+        BbrMode_t mode;          //!< state machine mode
+        BbrProbeBwPhase_t phase; //!< PROBE_BW phase
+        uint32_t inflightLo;     //!< inflight_lo, bytes (0xFFFFFFFF if unset)
+        uint32_t inflightHi;     //!< inflight_hi, bytes (0xFFFFFFFF if unset)
+        uint32_t extraAcked;     //!< bbr_extra_acked(), bytes
+        bool bwProbeSamples;     //!< bw_probe_samples: samples reflect bw probing
+        bool prevProbeTooHigh;   //!< prev_probe_too_high: last PROBE_UP went too high
+        bool stoppedRiskyProbe;  //!< stopped_risky_probe: last PROBE_UP stopped at inflight_hi
+        BbrAckPhase_t ackPhase;  //!< ack_phase
+    };
+
+    /**
+     * @brief Get the state Linux reports in struct tcp_bbr_info.
+     * @return the current BbrInfo.
+     */
+    BbrInfo GetBbrInfo() const;
 
     /**
      * @brief Enter startup phase.
@@ -190,10 +226,11 @@ class TcpBbrV3 : public TcpCongestionOps
 
     BbrMode_t m_state{BBR_STARTUP}; //!< Current top-level state
 
-    Time m_minRtt{Time::Max()};          //!< RTprop: the min RTT observed
-    Time m_minRttStamp{Time::Min()};     //!< Time m_minRtt was last updated
-    bool m_minRttExpired{false};         //!< Whether BBR.RTprop has expired
-    Time m_minRttFilterLen{Seconds(10)}; //!< Length of the RTprop min-filter window (Linux: min_rtt_win_sec)
+    Time m_minRtt{Time::Max()};      //!< RTprop: the min RTT observed
+    Time m_minRttStamp{Time::Min()}; //!< Time m_minRtt was last updated
+    bool m_minRttExpired{false};     //!< Whether BBR.RTprop has expired
+    Time m_minRttFilterLen{
+        Seconds(10)}; //!< Length of the RTprop min-filter window (Linux: min_rtt_win_sec)
 
     /**
      * @brief Two-stage min-RTT filter, matching Linux's bbr_update_min_rtt():
@@ -202,15 +239,17 @@ class TcpBbrV3 : public TcpCongestionOps
      * window (or immediately when a new short-window low is found). This
      * makes m_minRtt track more responsively than a single 10s window would.
      */
-    Time m_probeRttMin{Time::Max()};           //!< Min RTT observed within the short probe-RTT window
-    Time m_probeRttMinStamp{Time::Min()};      //!< Time m_probeRttMin was last updated
-    Time m_probeRttWinLen{MilliSeconds(5000)}; //!< Length of the short probe-RTT min-filter window (Linux: probe_rtt_win_ms)
-    bool m_probeRttExpired{false}; //!< Whether the short probe-RTT window has expired, which schedules PROBE_RTT
+    Time m_probeRttMin{Time::Max()};      //!< Min RTT observed within the short probe-RTT window
+    Time m_probeRttMinStamp{Time::Min()}; //!< Time m_probeRttMin was last updated
+    Time m_probeRttWinLen{MilliSeconds(
+        5000)}; //!< Length of the short probe-RTT min-filter window (Linux: probe_rtt_win_ms)
+    bool m_probeRttExpired{
+        false}; //!< Whether the short probe-RTT window has expired, which schedules PROBE_RTT
 
-    uint32_t m_roundCount{0};            //!< Count of packet-timed round trips
-    bool m_roundStart{false};            //!< True if a round-trip boundary was reached
-    uint64_t m_nextRoundDelivered{0};    //!< m_delivered value marking the next round trip
-    bool m_isPipeFilled{false};          //!< True once STARTUP has found the bottleneck's capacity
+    uint32_t m_roundCount{0};         //!< Count of packet-timed round trips
+    bool m_roundStart{false};         //!< True if a round-trip boundary was reached
+    uint64_t m_nextRoundDelivered{0}; //!< m_delivered value marking the next round trip
+    bool m_isPipeFilled{false};       //!< True once STARTUP has found the bottleneck's capacity
     TcpSocketState::TcpCongState_t m_prevCaState{
         TcpSocketState::CA_OPEN}; //!< CA state on the previous ACK. Linux: prev_ca_state.
 
@@ -229,21 +268,21 @@ class TcpBbrV3 : public TcpCongestionOps
 
     void UpdateRound(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs);
 
-    uint32_t m_fullBwCount{0}; //!< Number of round trips w/o large bw growth
-    DataRate m_fullBw{0};      //!< Last bw growth-plateau baseline
-    bool m_fullBwNow{false};   //!< True if the bw plateau was reached this round
-    double m_pacingGain{1};    //!< Current pacing gain
-    double m_cWndGain{1};      //!< Current cwnd gain
-    uint32_t m_cycleIndex{0};  //!< Unused: retained for parity with v1's field layout
-    Time m_cycleStamp{Seconds(0)}; //!< Time the current PROBE_BW sub-state was entered
-    bool m_isInitialized{false};   //!< False until the first CA_OPEN CongestionStateSet() call
+    uint32_t m_fullBwCount{0};       //!< Number of round trips w/o large bw growth
+    DataRate m_fullBw{0};            //!< Last bw growth-plateau baseline
+    bool m_fullBwNow{false};         //!< True if the bw plateau was reached this round
+    double m_pacingGain{1};          //!< Current pacing gain
+    double m_cWndGain{1};            //!< Current cwnd gain
+    uint32_t m_cycleIndex{0};        //!< Unused: retained for parity with v1's field layout
+    Time m_cycleStamp{Seconds(0)};   //!< Time the current PROBE_BW sub-state was entered
+    bool m_isInitialized{false};     //!< False until the first CA_OPEN CongestionStateSet() call
     Ptr<UniformRandomVariable> m_uv; //!< Rand, used for randomized bw-probe timing
     double m_highGain{0};            //!< STARTUP pacing gain (HighGain attribute)
     double m_startupCwndGain{2.0};   //!< STARTUP/DRAIN cwnd gain. Linux: bbr_startup_cwnd_gain.
     double m_drainGain{0.5};         //!< DRAIN pacing gain (DrainGain attribute)
     double m_probeBwDownGain{0.90};  //!< PROBE_BW DOWN pacing gain (ProbeBwDownGain attribute)
-    uint32_t m_drainMaxRounds{3};    //!< Max rounds in DRAIN; 0 = unbounded (DrainMaxRounds attribute)
-    uint32_t m_drainStartRound{0};   //!< m_roundCount when DRAIN was entered
+    uint32_t m_drainMaxRounds{3}; //!< Max rounds in DRAIN; 0 = unbounded (DrainMaxRounds attribute)
+    uint32_t m_drainStartRound{0}; //!< m_roundCount when DRAIN was entered
 
     static const char* const BbrModeName[BBR_PROBE_RTT + 1]; //!< Names for BbrMode_t, for logging
 
@@ -300,14 +339,15 @@ class TcpBbrV3 : public TcpCongestionOps
 
     uint64_t m_delivered{0}; //!< Mirrors rc.m_delivered on each CongControl() call
 
-    Time m_probeRttDoneStamp{Seconds(0)}; //!< Time to exit from BBR_PROBE_RTT state
-    bool m_idleRestart{false};            //!< When restarting from idle, set it true
-    uint32_t m_priorCwnd{0};              //!< The last-known good congestion window
-    uint32_t m_targetCWnd{0};             //!< Target cwnd, adapted to the estimated BDP
+    Time m_probeRttDoneStamp{Seconds(0)};       //!< Time to exit from BBR_PROBE_RTT state
+    bool m_idleRestart{false};                  //!< When restarting from idle, set it true
+    uint32_t m_priorCwnd{0};                    //!< The last-known good congestion window
+    uint32_t m_targetCWnd{0};                   //!< Target cwnd, adapted to the estimated BDP
     Time m_probeRttDuration{MilliSeconds(200)}; //!< Minimum duration to stay in PROBE_RTT
     bool m_probeRttRoundDone{false};            //!< True when it is time to exit BBR_PROBE_RTT
     uint32_t m_minPipeCwnd{0}; //!< General cwnd floor (4 * segment size). Linux: cwnd_min_target.
-    double m_probeRttCwndGain{0.5}; //!< Gain applied to BDP for the PROBE_RTT cwnd cap. Linux: probe_rtt_cwnd_gain.
+    double m_probeRttCwndGain{
+        0.5}; //!< Gain applied to BDP for the PROBE_RTT cwnd cap. Linux: probe_rtt_cwnd_gain.
     Ptr<TcpRateOps> m_rateOps; //!< Rate operations, used by HandleProbeRTT() to mark app-limited
 
     /**
@@ -322,15 +362,17 @@ class TcpBbrV3 : public TcpCongestionOps
     void RestoreCwnd(Ptr<TcpSocketState> tcb);
     void HandleProbeRTT(Ptr<TcpSocketState> tcb);
 
-    uint32_t m_extraAckedGain{1};                 //!< Gain factor for adding extra ack to cwnd
-    uint32_t m_extraAcked[2]{0, 0};               //!< Maximum excess data acked in epoch
-    uint32_t m_extraAckedWinRtt{0};               //!< Age of extra acked in rtt
-    uint32_t m_extraAckedWinRttLength{10};        //!< Rounds per extra_acked filter slot (ExtraAckedRtts attribute)
+    uint32_t m_extraAckedGain{1};   //!< Gain factor for adding extra ack to cwnd
+    uint32_t m_extraAcked[2]{0, 0}; //!< Maximum excess data acked in epoch
+    uint32_t m_extraAckedWinRtt{0}; //!< Age of extra acked in rtt
+    uint32_t m_extraAckedWinRttLength{
+        10}; //!< Rounds per extra_acked filter slot (ExtraAckedRtts attribute)
     uint32_t m_ackEpochAckedResetThresh{1 << 17}; //!< Max allowed m_ackEpochAcked, in bytes
     uint32_t m_extraAckedIdx{0};                  //!< Current index in extra acked array
     Time m_ackEpochTime;                          //!< Starting of ACK sampling epoch time
     uint32_t m_ackEpochAcked{0};                  //!< Bytes ACKed in sampling epoch
     uint32_t m_sendQuantum{0}; //!< Max size of a data aggregate scheduled and transmitted together
+    bool m_tsoBursts{false};   //!< Send TSO/GSO-sized bursts as Linux does (bbr_tso_segs())
 
     uint32_t InFlight(Ptr<TcpSocketState> tcb, DataRate bw, double gain);
     void InitPacingRate(Ptr<TcpSocketState> tcb);
@@ -355,10 +397,10 @@ class TcpBbrV3 : public TcpCongestionOps
     bool m_lossRoundStart{false};     //!< True on the round trip in which a new round starts
     uint8_t m_lossEventsInRound{0};   //!< Count of loss events this round (STARTUP only)
 
-    bool m_ecnInRound{false};      //!< True if an ECN mark was observed this round
-    bool m_ecnInCycle{false};      //!< True if an ECN mark was observed this PROBE_BW cycle
-    bool m_ecnEligible{false};     //!< Whether ECN marks should influence the model (never set true)
-    double m_ecnAlpha{0.0};        //!< EWMA of ecn-marked-bytes/total-bytes, in [0, 1]
+    bool m_ecnInRound{false};  //!< True if an ECN mark was observed this round
+    bool m_ecnInCycle{false};  //!< True if an ECN mark was observed this PROBE_BW cycle
+    bool m_ecnEligible{false}; //!< Whether ECN marks should influence the model (never set true)
+    double m_ecnAlpha{0.0};    //!< EWMA of ecn-marked-bytes/total-bytes, in [0, 1]
     uint8_t m_startupEcnRounds{0}; //!< Consecutive high-ECN STARTUP rounds seen so far
     uint32_t m_ecnThresh{50};      //!< CE-mark ratio threshold (0-100 scale) for "ECN too high"
     uint8_t m_fullEcnCnt{2};       //!< Consecutive high-ECN STARTUP rounds needed to exit
@@ -378,11 +420,12 @@ class TcpBbrV3 : public TcpCongestionOps
     DataRate m_bwHi[2]; //!< Windowed max-bandwidth filter (2-slot, replaces v1's single filter)
     uint32_t m_inflightLo{0xFFFFFFFF}; //!< Inflight lower bound (~0U sentinel means "unset")
     uint32_t m_inflightHi{0xFFFFFFFF}; //!< Inflight upper bound (~0U sentinel means "unset")
+    uint32_t m_segmentSize{1448};      //!< segment size, for FloorSegments()
     double m_beta{0.3};                //!< Multiplicative loss cut factor (30%)
     double m_lossThresh{0.02};         //!< Loss ratio threshold (2%) for "inflight too high"
-    uint8_t m_fullLossCnt{6}; //!< Consecutive high-loss rounds needed to exit STARTUP
+    uint8_t m_fullLossCnt{6};          //!< Consecutive high-loss rounds needed to exit STARTUP
 
-    DataRate m_undoBwLo;         //!< Rollback value for m_bwLo (not yet wired up)
+    DataRate m_undoBwLo;          //!< Rollback value for m_bwLo (not yet wired up)
     uint32_t m_undoInflightLo{0}; //!< Rollback value for m_inflightLo (not yet wired up)
     uint32_t m_undoInflightHi{0}; //!< Rollback value for m_inflightHi (not yet wired up)
 
@@ -392,7 +435,7 @@ class TcpBbrV3 : public TcpCongestionOps
     // ---- PROBE_BW sub-state machine (new in v3) ----
 
     BbrProbeBwPhase_t m_probeBwPhase{BBR_BW_PROBE_CRUISE}; //!< Current PROBE_BW sub-state
-    BbrAckPhase_t m_ackPhase{BBR_ACKS_INIT};                //!< Current bw-probe ACK phase
+    BbrAckPhase_t m_ackPhase{BBR_ACKS_INIT};               //!< Current bw-probe ACK phase
     uint8_t m_bwProbeUpRounds{0};    //!< Round count used by RaiseInflightHiSlope()
     uint32_t m_bwProbeUpCnt{0};      //!< ACKed-packets-per-inflight_hi-increment counter
     uint32_t m_bwProbeUpAcks{0};     //!< ACKed packets accumulated toward m_bwProbeUpCnt
@@ -423,6 +466,15 @@ class TcpBbrV3 : public TcpCongestionOps
      * and restart the cycle. Linux: bbr_handle_inflight_too_high(). */
     void HandleInflightTooHigh(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs);
 
+    /**
+     * @brief Inflight at which the loss rate crossed the threshold, within a
+     * lost segment (Linux: bbr_inflight_hi_from_lost_skb()).
+     * @param rs rate sample built from the lost segment's send-time state
+     * @param size segment size, in bytes
+     * @return the inflight_hi estimate, in bytes (0xFFFFFFFF if inconsistent)
+     */
+    uint32_t InflightHiFromLostSkb(const TcpRateOps::TcpRateSample& rs, uint32_t size) const;
+
     /** @brief Grow/shrink inflight_hi based on bw-probe feedback.
      * @return true if a state transition was already decided.
      * Linux: bbr_adapt_upper_bounds(). */
@@ -451,6 +503,18 @@ class TcpBbrV3 : public TcpCongestionOps
     /** @brief inflight_hi minus headroom, floored at the min cwnd target.
      * Linux: bbr_inflight_with_headroom(). */
     uint32_t InflightWithHeadroom() const;
+
+    /**
+     * @brief Round an inflight model value down to whole segments.
+     *
+     * Linux keeps inflight_hi, inflight_lo and the headroom in packets, so
+     * cwnd capped at one of them is a whole number of packets that inflight
+     * can reach; checks such as inflight >= inflight_hi depend on that.
+     *
+     * @param bytes value in bytes (0xFFFFFFFF, "unset", is kept)
+     * @return bytes rounded down to a multiple of the segment size
+     */
+    uint32_t FloorSegments(uint32_t bytes) const;
 
     /**
      * @brief Update per-round loss/ECN signals and adjust bw_lo/inflight_lo/hi.

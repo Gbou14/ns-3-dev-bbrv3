@@ -74,6 +74,7 @@ TcpRateLinux::GenerateSample(uint32_t delivered,
         NS_LOG_INFO("PriorTime is zero, invalidating sample");
         m_rateSample.m_delivered = -1;
         m_rateSample.m_interval = Seconds(0);
+        m_rateSample.m_deliveryRate = DataRate(0);
         m_rateSampleTrace(m_rateSample);
         return m_rateSample;
     }
@@ -104,10 +105,18 @@ TcpRateLinux::GenerateSample(uint32_t delivered,
     {
         NS_LOG_INFO("Sampling interval is invalid");
         m_rateSample.m_interval = Seconds(0);
+        m_rateSample.m_deliveryRate = DataRate(0);
         m_rateSample.m_priorTime = Seconds(0); // To make rate sample invalid
         m_rateSampleTrace(m_rateSample);
         return m_rateSample;
     }
+
+    // The rate of this sample, which is what congestion control consumes
+    // (Linux BBR: bbr_calculate_bw_sample() / bbr_update_bw() compute
+    // delivered / interval_us for every valid sample, app-limited or not).
+    m_rateSample.m_deliveryRate =
+        DataRate(m_rateSample.m_delivered * 8.0 / m_rateSample.m_interval.GetSeconds());
+    NS_LOG_INFO("Updating delivery rate=" << m_rateSample.m_deliveryRate);
 
     /* Record the last non-app-limited or the highest app-limited bw */
     if (!m_rateSample.m_isAppLimited || (m_rateSample.m_delivered * m_rate.m_rateInterval >=
@@ -116,9 +125,6 @@ TcpRateLinux::GenerateSample(uint32_t delivered,
         m_rate.m_rateDelivered = m_rateSample.m_delivered;
         m_rate.m_rateInterval = m_rateSample.m_interval;
         m_rate.m_rateAppLimited = m_rateSample.m_isAppLimited;
-        m_rateSample.m_deliveryRate =
-            DataRate(m_rateSample.m_delivered * 8.0 / m_rateSample.m_interval.GetSeconds());
-        NS_LOG_INFO("Updating delivery rate=" << m_rateSample.m_deliveryRate);
     }
 
     m_rateSampleTrace(m_rateSample);
@@ -176,7 +182,12 @@ TcpRateLinux::SkbDelivered(TcpTxItem* skb)
     m_rate.m_delivered += skb->GetSeqSize();
     m_rate.m_deliveredTime = Simulator::Now();
 
-    if (m_rateSample.m_priorDelivered == 0 || skbInfo.m_delivered > m_rateSample.m_priorDelivered)
+    // Measure from the most recently sent packet this ACK delivers (Linux:
+    // tcp_skb_sent_after() on its tx timestamp, ties broken by end sequence).
+    // Packets sent between the same two ACK arrivals share m_delivered, so
+    // comparing that count instead would keep the earlier one.
+    if (m_rateSample.m_priorDelivered == 0 || skb->GetLastSent() > m_rate.m_firstSentTime ||
+        (skb->GetLastSent() == m_rate.m_firstSentTime && skb->GetSeqEnd() > m_sampleLastEndSeq))
     {
         m_rateSample.m_ackElapsed = Simulator::Now() - skbInfo.m_deliveredTime;
         m_rateSample.m_priorDelivered = skbInfo.m_delivered;
@@ -185,6 +196,7 @@ TcpRateLinux::SkbDelivered(TcpTxItem* skb)
         m_rateSample.m_sendElapsed = skb->GetLastSent() - skbInfo.m_firstSent;
         m_rateSample.m_priorLost = skbInfo.m_lost;
         m_rateSample.m_txInFlight = skbInfo.m_inFlight;
+        m_sampleLastEndSeq = skb->GetSeqEnd();
 
         m_rateSampleTrace(m_rateSample);
 
@@ -197,6 +209,20 @@ TcpRateLinux::SkbDelivered(TcpTxItem* skb)
     skbInfo.m_deliveredTime = Time::Max();
     m_rate.m_txItemDelivered = skbInfo.m_delivered;
     m_rateTrace(m_rate);
+}
+
+void
+TcpRateLinux::StartSample()
+{
+    NS_LOG_FUNCTION(this);
+    m_rateSample.m_priorDelivered = 0;
+    m_rateSample.m_priorTime = Seconds(0);
+    m_rateSample.m_sendElapsed = Seconds(0);
+    m_rateSample.m_ackElapsed = Seconds(0);
+    m_rateSample.m_isAppLimited = false;
+    m_rateSample.m_priorLost = 0;
+    m_rateSample.m_txInFlight = 0;
+    m_sampleLastEndSeq = SequenceNumber32(0);
 }
 
 void

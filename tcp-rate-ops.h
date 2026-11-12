@@ -64,6 +64,16 @@ class TcpRateOps : public Object
     virtual void SkbDelivered(TcpTxItem* skb) = 0;
 
     /**
+     * @brief Start the rate sample of a newly received ACK.
+     *
+     * Must be called before the ACK's SACK and cumulative ACK information is
+     * processed. Linux starts each ACK with a zeroed struct rate_sample (see
+     * tcp_ack()), so the packet a sample is measured from is always one this
+     * ACK delivered, never one from an earlier ACK.
+     */
+    virtual void StartSample() = 0;
+
+    /**
      * @brief If a gap is detected between sends, it means we are app-limited.
      * TODO What the Linux kernel is setting in tp->app_limited?
      * https://elixir.bootlin.com/linux/latest/source/net/ipv4/tcp_rate.c#L177
@@ -145,10 +155,10 @@ class TcpRateOps : public Object
             0}; //!< The amount of data marked as lost from the most recent ack received
         uint32_t m_priorInFlight{0}; //!< The value if bytes in flight prior to last received ack
         uint32_t m_ackedSacked{0}; //!< The amount of data acked and sacked in the last received ack
-        uint64_t m_priorLost{0}; //!< Connection's cumulative lost bytes when the most recent
-                                 //!< packet delivered was sent
-        uint32_t m_txInFlight{0}; //!< Bytes in flight when the most recent packet delivered was
-                                  //!< sent (Linux: tx_in_flight)
+        uint64_t m_priorLost{0};   //!< Connection's cumulative lost bytes when the most recent
+                                   //!< packet delivered was sent
+        uint32_t m_txInFlight{0};  //!< Bytes in flight when the most recent packet delivered was
+                                   //!< sent (Linux: tx_in_flight)
         uint32_t m_lost{0}; //!< Bytes marked lost since the most recent packet delivered was sent
                             //!< (Linux: lost, as opposed to losses = m_bytesLoss)
 
@@ -205,6 +215,7 @@ class TcpRateLinux : public TcpRateOps
 
     void SkbSent(TcpTxItem* skb, bool isStartOfTransmission) override;
     void SkbDelivered(TcpTxItem* skb) override;
+    void StartSample() override;
     void CalculateAppLimited(uint32_t cWnd,
                              uint32_t in_flight,
                              uint32_t segmentSize,
@@ -250,8 +261,10 @@ class TcpRateLinux : public TcpRateOps
 
   private:
     // Rate sample related variables
-    TcpRateConnection m_rate;   //!< Rate information
-    TcpRateSample m_rateSample; //!< Rate sample (continuously updated)
+    TcpRateConnection m_rate;            //!< Rate information
+    TcpRateSample m_rateSample;          //!< Rate sample (continuously updated)
+    SequenceNumber32 m_sampleLastEndSeq; //!< End sequence of the packet the current sample is
+                                         //!< measured from (Linux: rs->last_end_seq)
 
     TracedCallback<const TcpRateConnection&> m_rateTrace;   //!< Rate trace
     TracedCallback<const TcpRateSample&> m_rateSampleTrace; //!< Rate Sample trace

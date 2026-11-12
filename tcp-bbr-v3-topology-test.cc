@@ -68,11 +68,11 @@ SetCongestionControl(Ptr<Node> node, const std::string& typeName)
  */
 Ptr<PacketSink>
 InstallBulkFlow(Ptr<Node> src,
-               Ptr<Node> dst,
-               Ipv4Address dstAddress,
-               uint16_t port,
-               Time start,
-               Time stop)
+                Ptr<Node> dst,
+                Ipv4Address dstAddress,
+                uint16_t port,
+                Time start,
+                Time stop)
 {
     BulkSendHelper source("ns3::TcpSocketFactory", InetSocketAddress(dstAddress, port));
     source.SetAttribute("MaxBytes", UintegerValue(0));
@@ -95,11 +95,11 @@ InstallBulkFlow(Ptr<Node> src,
  */
 struct SingleBottleneckTopology
 {
-    NodeContainer sender;              //!< Sender leaf node
-    NodeContainer receiver;            //!< Receiver leaf node
-    NodeContainer routers;             //!< The two bottleneck routers
+    NodeContainer sender;                        //!< Sender leaf node
+    NodeContainer receiver;                      //!< Receiver leaf node
+    NodeContainer routers;                       //!< The two bottleneck routers
     Ptr<PointToPointNetDevice> bottleneckDevice; //!< R1's device on the R1->R2 link
-    Ipv4Address receiverAddress;       //!< Receiver's IPv4 address
+    Ipv4Address receiverAddress;                 //!< Receiver's IPv4 address
 };
 
 /**
@@ -129,14 +129,17 @@ BuildSingleBottleneckTopology(DataRate bottleneckRate,
     bottleneckLink.SetChannelAttribute("Delay", TimeValue(bottleneckDelay));
     // The device queue is kept minimal; the FIFO queue disc installed below is
     // the buffer that actually governs bottleneck queueing behavior.
-    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("2p")));
+    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>",
+                            "MaxSize",
+                            QueueSizeValue(QueueSize("2p")));
 
     PointToPointHelper accessLink;
     accessLink.SetDeviceAttribute("DataRate", DataRateValue(accessRate));
     accessLink.SetChannelAttribute("Delay", TimeValue(accessDelay));
 
     NetDeviceContainer senderEdge = accessLink.Install(topo.sender.Get(0), topo.routers.Get(0));
-    NetDeviceContainer bottleneck = bottleneckLink.Install(topo.routers.Get(0), topo.routers.Get(1));
+    NetDeviceContainer bottleneck =
+        bottleneckLink.Install(topo.routers.Get(0), topo.routers.Get(1));
     NetDeviceContainer receiverEdge = accessLink.Install(topo.routers.Get(1), topo.receiver.Get(0));
 
     InternetStackHelper internet;
@@ -199,7 +202,9 @@ TcpBbrV3CoexistenceTest::DoRun()
     PointToPointHelper bottleneckLink;
     bottleneckLink.SetDeviceAttribute("DataRate", DataRateValue(bottleneckRate));
     bottleneckLink.SetChannelAttribute("Delay", TimeValue(MilliSeconds(20)));
-    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("2p")));
+    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>",
+                            "MaxSize",
+                            QueueSizeValue(QueueSize("2p")));
 
     PointToPointHelper edgeLink;
     edgeLink.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Mbps")));
@@ -280,7 +285,7 @@ class TcpBbrV3DynamicBottleneckTest : public TestCase
      */
     void Sample();
 
-    Ptr<PacketSink> m_sink;                       //!< The receiving sink
+    Ptr<PacketSink> m_sink;                           //!< The receiving sink
     std::vector<std::pair<Time, uint64_t>> m_samples; //!< (time, cumulative bytes) samples
 };
 
@@ -354,7 +359,7 @@ TcpBbrV3DynamicBottleneckTest::DoRun()
         }
     }
 
-    double preStepThroughput = (bytesAt29 - bytesAt25) / 4.0;   // bytes/s
+    double preStepThroughput = (bytesAt29 - bytesAt25) / 4.0;  // bytes/s
     double postStepThroughput = (bytesAt59 - bytesAt50) / 9.0; // bytes/s
 
     NS_TEST_ASSERT_MSG_GT(postStepThroughput,
@@ -562,9 +567,8 @@ TcpBbrV3BufferbloatTest::DoRun()
                     simDuration);
 
     Simulator::Schedule(MilliSeconds(1), [this]() {
-        Config::ConnectWithoutContext(
-            "/NodeList/0/$ns3::TcpL4Protocol/SocketList/0/RTT",
-            MakeCallback(&TcpBbrV3BufferbloatTest::RttTrace, this));
+        Config::ConnectWithoutContext("/NodeList/0/$ns3::TcpL4Protocol/SocketList/0/RTT",
+                                      MakeCallback(&TcpBbrV3BufferbloatTest::RttTrace, this));
     });
 
     Simulator::Stop(simDuration + Seconds(1));
@@ -615,7 +619,9 @@ TcpBbrV3MultiFlowFairnessTest::DoRun()
     PointToPointHelper bottleneckLink;
     bottleneckLink.SetDeviceAttribute("DataRate", DataRateValue(DataRate("20Mbps")));
     bottleneckLink.SetChannelAttribute("Delay", TimeValue(MilliSeconds(20)));
-    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("2p")));
+    bottleneckLink.SetQueue("ns3::DropTailQueue<Packet>",
+                            "MaxSize",
+                            QueueSizeValue(QueueSize("2p")));
 
     PointToPointHelper edgeLink;
     edgeLink.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Mbps")));
@@ -705,6 +711,7 @@ class TcpBbrV3TopologyTestSuite : public TestSuite
     }
 };
 
-static TcpBbrV3TopologyTestSuite g_tcpBbrV3TopologyTest; //!< static variable for test initialization
+static TcpBbrV3TopologyTestSuite
+    g_tcpBbrV3TopologyTest; //!< static variable for test initialization
 
 } // namespace ns3

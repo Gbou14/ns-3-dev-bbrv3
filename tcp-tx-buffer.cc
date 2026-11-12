@@ -913,7 +913,7 @@ TcpTxBuffer::UpdateLostCount()
             {
                 item->m_lost = true;
                 m_lostOut += item->m_packet->GetSize();
-                m_lostTotal += item->m_packet->GetSize();
+                NotifyLost(item);
             }
         }
         beginOfCurrentPacket -= item->m_packet->GetSize();
@@ -926,7 +926,7 @@ TcpTxBuffer::UpdateLostCount()
         {
             item->m_lost = true;
             m_lostOut += item->m_packet->GetSize();
-            m_lostTotal += item->m_packet->GetSize();
+            NotifyLost(item);
         }
     }
     NS_LOG_INFO("Status after the update: " << *this);
@@ -954,8 +954,10 @@ TcpTxBuffer::MarkRetransmittedSegmentsLost(const Time& sackedSentTime)
             {
                 item->m_lost = true;
                 m_lostOut += item->m_packet->GetSize();
-                m_lostTotal += item->m_packet->GetSize();
             }
+            // A lost retransmission is a new loss, as in Linux's
+            // tcp_mark_skb_lost() (LINUX_MIB_TCPLOSTRETRANSMIT).
+            NotifyLost(item);
             NS_LOG_INFO("Retransmission of segment " << *item << " deemed lost");
         }
         beginOfCurrentPacket += item->m_packet->GetSize();
@@ -1260,6 +1262,22 @@ TcpTxBuffer::ResetRenoSack()
 }
 
 void
+TcpTxBuffer::SetSkbLostCallback(Callback<void, TcpTxItem*> lostCb)
+{
+    m_skbLostCb = lostCb;
+}
+
+void
+TcpTxBuffer::NotifyLost(TcpTxItem* item)
+{
+    m_lostTotal += item->m_packet->GetSize();
+    if (!m_skbLostCb.IsNull())
+    {
+        m_skbLostCb(item);
+    }
+}
+
+void
 TcpTxBuffer::SetRWndCallback(Callback<uint32_t> rWndCallback)
 {
     NS_LOG_FUNCTION(this);
@@ -1330,12 +1348,13 @@ TcpTxBuffer::SetSentListLost(bool resetSack)
     {
         if (resetSack)
         {
-            if (!(*it)->m_lost)
-            {
-                m_lostTotal += (*it)->m_packet->GetSize();
-            }
+            bool wasLost = (*it)->m_lost;
             (*it)->m_sacked = false;
             (*it)->m_lost = true;
+            if (!wasLost)
+            {
+                NotifyLost(*it);
+            }
         }
         else
         {
@@ -1349,7 +1368,7 @@ TcpTxBuffer::SetSentListLost(bool resetSack)
                 // Packet is not marked lost, nor is sacked. Then it becomes lost.
                 (*it)->m_lost = true;
                 m_lostOut += (*it)->m_packet->GetSize();
-                m_lostTotal += (*it)->m_packet->GetSize();
+                NotifyLost(*it);
             }
         }
 
@@ -1416,7 +1435,7 @@ TcpTxBuffer::MarkHeadAsLost()
         {
             m_sentList.front()->m_lost = true;
             m_lostOut += m_sentList.front()->m_packet->GetSize();
-            m_lostTotal += m_sentList.front()->m_packet->GetSize();
+            NotifyLost(m_sentList.front());
         }
     }
     ConsistencyCheck();

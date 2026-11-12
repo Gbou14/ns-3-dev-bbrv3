@@ -409,7 +409,24 @@ class TcpTxBuffer : public Object
      */
     void SetRWndCallback(Callback<uint32_t> rWndCallback);
 
+    /**
+     * @brief Set the callback invoked for every segment as it is marked lost.
+     *
+     * It runs after the cumulative lost count (GetTotalLost()) includes the
+     * segment, as Linux's tcp_notify_skb_loss_event() does before calling the
+     * congestion control's skb_marked_lost hook.
+     *
+     * @param lostCb callback taking the segment just marked lost
+     */
+    void SetSkbLostCallback(Callback<void, TcpTxItem*> lostCb);
+
   private:
+    /**
+     * @brief Count a segment just marked lost and notify the lost callback.
+     * @param item the segment
+     */
+    void NotifyLost(TcpTxItem* item);
+
     friend std::ostream& operator<<(std::ostream& os, const TcpTxBuffer& tcpTxBuf);
 
     typedef std::list<TcpTxItem*> PacketList; //!< container for data stored in the buffer
@@ -635,10 +652,11 @@ class TcpTxBuffer : public Object
         m_firstByteSeq; //!< Sequence number of the first byte in data (SND.UNA)
     std::pair<PacketList::const_iterator, SequenceNumber32> m_highestSack; //!< Highest SACK byte
 
-    uint32_t m_lostOut{0};   //!< Number of lost bytes
-    uint64_t m_lostTotal{0}; //!< Cumulative number of bytes ever marked lost
-    uint32_t m_sackedOut{0}; //!< Number of sacked bytes
-    uint32_t m_retrans{0};   //!< Number of retransmitted bytes
+    uint32_t m_lostOut{0};                  //!< Number of lost bytes
+    uint64_t m_lostTotal{0};                //!< Cumulative number of bytes ever marked lost
+    Callback<void, TcpTxItem*> m_skbLostCb; //!< Called for each segment marked lost
+    uint32_t m_sackedOut{0};                //!< Number of sacked bytes
+    uint32_t m_retrans{0};                  //!< Number of retransmitted bytes
 
     uint32_t m_dupAckThresh{0}; //!< Duplicate Ack threshold from TcpSocketBase
     uint32_t m_segmentSize{0};  //!< Segment size from TcpSocketBase

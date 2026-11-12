@@ -332,18 +332,16 @@ class TcpBbrV3TestSuite : public TestSuite
         AddTestCase(new TcpBbrV3PacingEnableTest(false, "BBRv3 must turn on pacing feature"),
                     TestCase::Duration::QUICK);
 
-        AddTestCase(
-            new TcpBbrV3CheckGainValuesTest(
-                TcpBbrV3::BBR_STARTUP,
-                2.77,
-                "BBRv3 should enter STARTUP with pacing gain HighGain and cwnd gain 2"),
-            TestCase::Duration::QUICK);
-        AddTestCase(
-            new TcpBbrV3CheckGainValuesTest(
-                TcpBbrV3::BBR_DRAIN,
-                2.77,
-                "BBRv3 should enter DRAIN with pacing gain 0.5 and cwnd gain 2"),
-            TestCase::Duration::QUICK);
+        AddTestCase(new TcpBbrV3CheckGainValuesTest(
+                        TcpBbrV3::BBR_STARTUP,
+                        2.77,
+                        "BBRv3 should enter STARTUP with pacing gain HighGain and cwnd gain 2"),
+                    TestCase::Duration::QUICK);
+        AddTestCase(new TcpBbrV3CheckGainValuesTest(
+                        TcpBbrV3::BBR_DRAIN,
+                        2.77,
+                        "BBRv3 should enter DRAIN with pacing gain 0.5 and cwnd gain 2"),
+                    TestCase::Duration::QUICK);
         AddTestCase(
             new TcpBbrV3CheckGainValuesTest(TcpBbrV3::BBR_PROBE_RTT,
                                             2.77,

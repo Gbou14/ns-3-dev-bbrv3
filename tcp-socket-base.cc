@@ -151,6 +151,15 @@ TcpSocketBase::GetTypeId()
                 // See http://www.postel.org/pipermail/end2end-interest/2004-November/004402.html
                 MakeTimeAccessor(&TcpSocketBase::SetMinRto, &TcpSocketBase::GetMinRto),
                 MakeTimeChecker())
+            .AddAttribute("LinuxRto",
+                          "Compute and restart the retransmission timer as Linux does: "
+                          "RTO = SRTT + max(4 * RTTVAR, MinRto) (tcp_rtt_estimator(), "
+                          "__tcp_set_rto()), restarted when the first unacknowledged segment "
+                          "is retransmitted (tcp_xmit_retransmit_queue()). If false, RFC 6298: "
+                          "RTO = max(SRTT + max(G, 4 * RTTVAR), MinRto), restarted on new ACKs.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&TcpSocketBase::m_linuxRto),
+                          MakeBooleanChecker())
             .AddAttribute(
                 "ClockGranularity",
                 "Clock Granularity used in RTO calculations",
@@ -310,6 +319,7 @@ TcpSocketBase::TcpSocketBase()
 
     m_txBuffer = CreateObject<TcpTxBuffer>();
     m_txBuffer->SetRWndCallback(MakeCallback(&TcpSocketBase::GetRWnd, this));
+    m_txBuffer->SetSkbLostCallback(MakeCallback(&TcpSocketBase::NotifySkbLost, this));
     m_tcb = CreateObject<TcpSocketState>();
     m_rateOps = CreateObject<TcpRateLinux>();
 
@@ -454,6 +464,7 @@ TcpSocketBase::TcpSocketBase(const TcpSocketBase& sock)
     SetRecvCallback(vPS);
     m_txBuffer = CopyObject(sock.m_txBuffer);
     m_txBuffer->SetRWndCallback(MakeCallback(&TcpSocketBase::GetRWnd, this));
+    m_txBuffer->SetSkbLostCallback(MakeCallback(&TcpSocketBase::NotifySkbLost, this));
     m_tcb = CopyObject(sock.m_tcb);
     m_tcb->m_rxBuffer = CopyObject(sock.m_tcb->m_rxBuffer);
 
@@ -1949,6 +1960,7 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
     // scoreboard MUST be updated via the Update () routine (done in ReadOptions)
     uint32_t bytesSacked = 0;
     uint64_t previousDelivered = m_rateOps->GetConnectionRate().m_delivered;
+    m_rateOps->StartSample();
     ReadOptions(tcpHeader, &bytesSacked);
 
     SequenceNumber32 ackNumber = tcpHeader.GetAckNumber();
@@ -3326,7 +3338,8 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     NS_ASSERT(isRetransmission ||
               ((m_highRxAckMark + SequenceNumber32(m_rWnd)) >= (seq + SequenceNumber32(maxSize))));
 
-    if (IsPacingEnabled())
+    // Inside SendPendingData() the pacing timer is set once per burst, there.
+    if (IsPacingEnabled() && !m_inPacingBurst)
     {
         NS_LOG_INFO("Pacing is enabled");
         if (m_pacingTimer.IsExpired())
@@ -3396,10 +3409,15 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     header.SetWindowSize(AdvertisedWindowSize());
     AddOptions(header);
 
-    if (m_retxEvent.IsExpired())
+    // Linux restarts the timer when it retransmits the head of the
+    // retransmission queue (tcp_xmit_retransmit_queue()), so a fast
+    // retransmission gets a full RTO to be acknowledged.
+    bool restartForHead = m_linuxRto && isRetransmission && seq == m_txBuffer->HeadSequence() &&
+                          m_retxEvent.IsPending();
+    if (m_retxEvent.IsExpired() || restartForHead)
     {
         // Schedules retransmit timeout. m_rto should be already doubled.
-
+        m_retxEvent.Cancel();
         NS_LOG_LOGIC(this << " SendDataPacket Schedule ReTxTimeout at time "
                           << Simulator::Now().GetSeconds() << " to expire at time "
                           << (Simulator::Now() + m_rto.Get()).GetSeconds());
@@ -3521,6 +3539,16 @@ TcpSocketBase::SendPendingData(bool withAck)
     uint32_t nPacketsSent = 0;
     uint32_t availableWindow = AvailableWindow();
 
+    // With pacing, up to m_sendQuantum bytes go out back to back and the
+    // pacing timer then waits for the whole burst's transmission time at the
+    // pacing rate, as Linux paces each TSO/GSO skb by its length. The default
+    // (0) ends the burst after every segment.
+    uint32_t burstBytes = 0;
+    uint32_t quantum = std::max<uint32_t>(m_tcb->m_sendQuantum, 1);
+    m_inPacingBurst = IsPacingEnabled();
+    bool burstRetx = false;    // the burst so far carries retransmitted data
+    SequenceNumber32 burstEnd; // sequence after the burst so far
+
     // RFC 6675, Section (C)
     // If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
     // segments as follows:
@@ -3559,6 +3587,17 @@ TcpSocketBase::SendPendingData(bool withAck)
         }
         else
         {
+            // A burst stands for one Linux skb: retransmitted and new data never
+            // share one, and a retransmission covers one contiguous lost range
+            // (tcp_xmit_retransmit_queue() sends each rtx-queue skb on its own,
+            // trimmed by __tcp_retransmit_skb(), before tcp_write_xmit() sends
+            // new data). So end the burst there; it is paced after the loop.
+            bool isRetx = next < m_tcb->m_highTxMark.Get();
+            if (burstBytes > 0 && (isRetx != burstRetx || next != burstEnd))
+            {
+                break;
+            }
+
             // It's time to transmit, but before do silly window and Nagle's check
             uint32_t availableData = m_txBuffer->SizeFromSequence(next);
 
@@ -3619,15 +3658,21 @@ TcpSocketBase::SendPendingData(bool withAck)
                                   << " sent seq " << m_tcb->m_nextTxSequence << " size " << sz);
             m_tcb->m_nextTxSequence += sz;
             ++nPacketsSent;
+            burstRetx = isRetx;
+            burstEnd = next + sz;
             if (IsPacingEnabled())
             {
                 NS_LOG_INFO("Pacing is enabled");
-                if (m_pacingTimer.IsExpired())
+                burstBytes += sz;
+                if (burstBytes >= quantum && m_pacingTimer.IsExpired())
                 {
                     NS_LOG_DEBUG("Current Pacing Rate " << m_tcb->m_pacingRate);
-                    NS_LOG_DEBUG("Timer is in expired state, activate it "
-                                 << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-                    m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
+                    NS_LOG_DEBUG("Burst of "
+                                 << burstBytes << " bytes sent, activate timer "
+                                 << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
+                    m_pacingTimer.Schedule(
+                        m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
+                    burstBytes = 0;
                     break;
                 }
             }
@@ -3642,6 +3687,14 @@ TcpSocketBase::SendPendingData(bool withAck)
 
         // (C.5) If cwnd - pipe >= 1 SMSS, return to (C.1)
         // loop again!
+    }
+
+    m_inPacingBurst = false;
+    if (burstBytes > 0 && m_pacingTimer.IsExpired())
+    {
+        // A burst cut short by the window or the data still waits for its own
+        // transmission time.
+        m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
     }
 
     if (nPacketsSent > 0)
@@ -3878,7 +3931,16 @@ TcpSocketBase::CalculateRttSample(const TcpHeader& tcpHeader, const RttHistory& 
         // segments is when the TCP timestamp option is employed, since
         // the timestamp option removes the ambiguity regarding which instance
         // of the data segment triggered the acknowledgment.
-        if (m_timestampEnabled && tcpHeader.HasOption(TcpOption::TS))
+        //
+        // Like Linux (tcp_ack_update_rtt(): "Prefer RTT measured from ACK's
+        // timing to TS-ECR"), the transmit time is used when the segment was
+        // not retransmitted; the timestamp option only has millisecond
+        // resolution here.
+        if (!rttHistory.retx)
+        {
+            rtt = Simulator::Now() - rttHistory.time;
+        }
+        else if (m_timestampEnabled && tcpHeader.HasOption(TcpOption::TS))
         {
             Ptr<const TcpOptionTS> ts;
             ts = DynamicCast<const TcpOptionTS>(tcpHeader.GetOption(TcpOption::TS));
@@ -3891,13 +3953,33 @@ TcpSocketBase::CalculateRttSample(const TcpHeader& tcpHeader, const RttHistory& 
                 rtt = MicroSeconds(1);
             }
         }
-        else if (!rttHistory.retx)
-        {
-            // Elapsed time since the packet was transmitted
-            rtt = Simulator::Now() - rttHistory.time;
-        }
     }
     return rtt;
+}
+
+void
+TcpSocketBase::NotifySkbLost(TcpTxItem* item)
+{
+    if (m_congestionControl)
+    {
+        m_congestionControl->SkbMarkedLost(m_tcb,
+                                           item->GetRateInformation(),
+                                           item->GetSeqSize(),
+                                           m_txBuffer->GetTotalLost());
+    }
+}
+
+Time
+TcpSocketBase::ComputeRto() const
+{
+    if (m_linuxRto)
+    {
+        // Linux keeps rttvar_us >= tcp_rto_min, so the minimum bounds the
+        // variance term rather than the whole timeout.
+        return m_rtt->GetEstimate() + Max(m_rtt->GetVariation() * 4, m_minRto);
+    }
+    // RFC 6298, clause 2.4
+    return Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4), m_minRto);
 }
 
 void
@@ -3945,9 +4027,7 @@ TcpSocketBase::EstimateRtt(const TcpHeader& tcpHeader)
     if (!rtt.IsZero())
     {
         m_rtt->Measurement(rtt); // Log the measurement
-        // RFC 6298, clause 2.4
-        m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
-                    m_minRto);
+        m_rto = ComputeRto();
         m_tcb->m_srtt = m_rtt->GetEstimate();
         m_tcb->m_minRtt = std::min(m_tcb->m_srtt.Get(), m_tcb->m_minRtt);
         NS_LOG_INFO(this << m_tcb->m_srtt << m_tcb->m_minRtt);
@@ -3979,9 +4059,7 @@ TcpSocketBase::NewAck(const SequenceNumber32& ack, bool resetRTO)
                  << (Simulator::Now() + Simulator::GetDelayLeft(m_retxEvent)).GetSeconds());
         m_retxEvent.Cancel();
         // On receiving a "New" ack we restart retransmission timer .. RFC 6298
-        // RFC 6298, clause 2.4
-        m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
-                    m_minRto);
+        m_rto = ComputeRto();
 
         NS_LOG_LOGIC(this << " Schedule ReTxTimeout at time " << Simulator::Now().GetSeconds()
                           << " to expire at time "
