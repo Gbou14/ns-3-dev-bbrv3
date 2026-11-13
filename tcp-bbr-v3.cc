@@ -804,8 +804,10 @@ TcpBbrV3::RaiseInflightHiSlope(Ptr<TcpSocketState> tcb)
     // Calculate "slope": packets S/ACKed per inflight_hi increment.
     uint32_t growthThisRound = 1u << m_bwProbeUpRounds;
     m_bwProbeUpRounds = std::min<uint8_t>(m_bwProbeUpRounds + 1, 30);
+    // Linux counts in packets, with a floor of one packet; this port counts
+    // ACKed bytes, so the floor is one segment.
     uint32_t cnt = tcb->m_cWnd.Get() / growthThisRound;
-    cnt = std::max<uint32_t>(cnt, 1);
+    cnt = std::max<uint32_t>(cnt, tcb->m_segmentSize);
     m_bwProbeUpCnt = cnt;
 }
 

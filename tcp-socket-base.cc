@@ -3347,8 +3347,7 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
             NS_LOG_DEBUG("Current Pacing Rate " << m_tcb->m_pacingRate);
             NS_LOG_DEBUG("Timer is in expired state, activate it "
                          << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-            m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-            m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+            SchedulePacing(sz);
         }
         else
         {
@@ -3679,9 +3678,7 @@ TcpSocketBase::SendPendingData(bool withAck)
                     NS_LOG_DEBUG("Burst of "
                                  << burstBytes << " bytes sent, activate timer "
                                  << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
-                    m_pacingTimer.Schedule(
-                        m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
-                    m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+                    SchedulePacing(burstBytes);
                     burstBytes = 0;
                     break;
                 }
@@ -3706,8 +3703,7 @@ TcpSocketBase::SendPendingData(bool withAck)
     {
         // A burst cut short by the window or the data still waits for its own
         // transmission time.
-        m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
-        m_tcb->m_pacingRelease = Simulator::Now() + m_pacingTimer.GetDelay();
+        SchedulePacing(burstBytes);
     }
 
     if (nPacketsSent > 0)
@@ -3752,6 +3748,22 @@ uint32_t
 TcpSocketBase::Window() const
 {
     return std::min(m_rWnd.Get(), m_tcb->m_cWnd.Get());
+}
+
+void
+TcpSocketBase::SchedulePacing(uint32_t bytes)
+{
+    Time now = Simulator::Now();
+    Time len = m_tcb->m_pacingRate.Get().CalculateBytesTxTime(bytes);
+    if (m_tcb->m_sendQuantum > 0 && now > m_tcb->m_pacingRelease)
+    {
+        // Linux tcp_update_skb_after_send(): if this send is later than
+        // pacing allowed (for example after waiting for an ACK), take back
+        // the delay, up to half this skb's pacing time ("OS jitter" credit).
+        len -= std::min(len / 2, now - m_tcb->m_pacingRelease);
+    }
+    m_pacingTimer.Schedule(len);
+    m_tcb->m_pacingRelease = now + len;
 }
 
 bool

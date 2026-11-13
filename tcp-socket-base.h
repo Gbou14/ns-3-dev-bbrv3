@@ -1102,6 +1102,15 @@ class TcpSocketBase : public TcpSocket
     void CwndValidate(bool isCwndLimited, bool sent);
 
     /**
+     * @brief Start the pacing timer for data just sent. With a send quantum
+     * (Linux-style bursts), a send later than pacing allowed gets back up to
+     * half its pacing time, as Linux's tcp_update_skb_after_send() does.
+     *
+     * @param bytes bytes just sent
+     */
+    void SchedulePacing(uint32_t bytes);
+
+    /**
      * @brief The amount of Rx window announced to the peer
      * @param scale indicate if the window should be scaled. True for
      * almost all cases, except when we are sending a SYN
