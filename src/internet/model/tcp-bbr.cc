@@ -13,6 +13,8 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 
+#include <limits>
+
 namespace ns3
 {
 
@@ -501,7 +503,6 @@ TcpBbr::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateS
     NS_LOG_FUNCTION(this << tcb << rs);
     uint32_t expectedAcked;
     uint32_t extraAck;
-    uint32_t epochProp;
 
     if (!m_extraAckedGain || rs.m_ackedSacked <= 0 || rs.m_delivered < 0)
     {
@@ -519,8 +520,13 @@ TcpBbr::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateS
         }
     }
 
-    epochProp = Simulator::Now().GetSeconds() - m_ackEpochTime.GetSeconds();
-    expectedAcked = m_maxBwFilter.GetBest().GetBitRate() * epochProp / 8;
+    // Keep sub-second resolution: truncating the epoch to whole seconds makes
+    // expectedAcked 0 for the first second of every epoch, so all ACKed data
+    // counts as aggregation and pads cwnd by a full extra BDP.
+    Time epoch = Simulator::Now() - m_ackEpochTime;
+    expectedAcked = static_cast<uint32_t>(
+        std::min<double>(m_maxBwFilter.GetBest().GetBitRate() * epoch.GetSeconds() / 8.0,
+                         std::numeric_limits<uint32_t>::max()));
 
     if (m_ackEpochAcked <= expectedAcked ||
         (m_ackEpochAcked + rs.m_ackedSacked >= m_ackEpochAckedResetThresh))
