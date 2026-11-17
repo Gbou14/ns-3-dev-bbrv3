@@ -9,6 +9,7 @@
 
 #include "tcp-rate-ops.h"
 #include "tcp-socket-state.h"
+#include "tcp-tx-item.h"
 
 namespace ns3
 {
@@ -181,6 +182,24 @@ class TcpCongestionOps : public Object
     virtual void CongControl(Ptr<TcpSocketState> tcb,
                              const TcpRateOps::TcpRateConnection& rc,
                              const TcpRateOps::TcpRateSample& rs);
+
+    /**
+     * @brief Called for each segment as it is marked lost.
+     *
+     * Mirrors Linux's skb_marked_lost hook: it runs as soon as the segment is
+     * marked lost, after the cumulative lost count includes it, with the
+     * state the segment was sent with.
+     *
+     * @param tcb internal congestion state
+     * @param txInfo rate information the segment was sent with
+     * @param size segment size, in bytes
+     * @param totalLost cumulative bytes marked lost on the connection,
+     * including this segment
+     */
+    virtual void SkbMarkedLost(Ptr<TcpSocketState> tcb,
+                               const TcpTxItem::RateInformation& txInfo,
+                               uint32_t size,
+                               uint64_t totalLost);
 
     // Present in Linux but not in ns-3 yet:
     /* call when ack arrives (optional) */

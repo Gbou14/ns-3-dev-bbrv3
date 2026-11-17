@@ -293,7 +293,6 @@ class TcpRateLinuxWithSocketsTest : public TcpGeneralTest
     SequenceNumber32 m_lastAckRecv{SequenceNumber32(1)}; //!< Last ACK received.
     bool m_isDupAck;                                     //!< Whether ACK is DupAck
     TcpRateLinux::TcpRateConnection m_prevRate;          //!< Previous rate
-    TcpRateLinux::TcpRateSample m_prevRateSample;        //!< Previous rate sample
 };
 
 TcpRateLinuxWithSocketsTest::TcpRateLinuxWithSocketsTest(const std::string& desc,
@@ -394,25 +393,18 @@ void
 TcpRateLinuxWithSocketsTest::RateSampleUpdatedTrace(const TcpRateLinux::TcpRateSample& sample)
 {
     NS_LOG_DEBUG("Rate sample updated " << sample);
-    if (m_isDupAck)
+    // An ACK that delivers nothing gives an invalid sample, as in Linux
+    // (tcp_rate_gen() with no rs->prior_mstamp), rather than repeating the
+    // previous ACK's sample.
+    if (m_isDupAck && (!m_sackEnabled || sample.m_ackedSacked == 0))
     {
-        if (!m_sackEnabled)
-        {
-            NS_TEST_ASSERT_MSG_EQ(m_prevRateSample,
-                                  sample,
-                                  "RateSample should not update due to DupAcks");
-        }
-        else
-        {
-            if (sample.m_ackedSacked == 0)
-            {
-                NS_TEST_ASSERT_MSG_EQ(m_prevRateSample,
-                                      sample,
-                                      "RateSample should not update as nothing is acked or sacked");
-            }
-        }
+        NS_TEST_ASSERT_MSG_EQ(sample.IsValid(),
+                              false,
+                              "RateSample should be invalid when nothing is acked or sacked");
+        NS_TEST_ASSERT_MSG_EQ(sample.m_delivered,
+                              -1,
+                              "RateSample should be invalid when nothing is acked or sacked");
     }
-    m_prevRateSample = sample;
 }
 
 void

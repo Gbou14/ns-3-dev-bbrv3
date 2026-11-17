@@ -69,6 +69,15 @@ TcpCongestionOps::HasCongControl() const
 }
 
 void
+TcpCongestionOps::SkbMarkedLost(Ptr<TcpSocketState> tcb,
+                                const TcpTxItem::RateInformation& txInfo,
+                                uint32_t size,
+                                uint64_t totalLost)
+{
+    NS_LOG_FUNCTION(this << tcb << size << totalLost);
+}
+
+void
 TcpCongestionOps::CongControl(Ptr<TcpSocketState> tcb,
                               const TcpRateOps::TcpRateConnection& /* rc */,
                               const TcpRateOps::TcpRateSample& /* rs */)
@@ -136,7 +145,7 @@ TcpNewReno::~TcpNewReno()
  *
  * The ns-3 implementation respect the RFC definition. Linux does something
  * different:
- * @code{.cpp}
+ * \code{.cpp}
    u32 tcp_slow_start(struct tcp_sock *tp, u32 acked)
    {
      u32 cwnd = tp->snd_cwnd + acked;
@@ -148,7 +157,7 @@ TcpNewReno::~TcpNewReno()
 
      return acked;
    }
-   @endcode
+   \endcode
  *
  * As stated, we want to avoid the case when a cumulative ACK increases cWnd more
  * than a segment size, but we keep count of how many segments we have ignored,

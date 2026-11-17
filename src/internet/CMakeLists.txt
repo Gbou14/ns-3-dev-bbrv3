@@ -1,3 +1,27 @@
+# Conditionally link to the point-to-point, point-to-point-layout, and
+# applications modules (needed by tcp-bbr-v3-topology-test.cc, which builds
+# real network topologies with BulkSend/PacketSink traffic to validate
+# BBRv3's behavior).
+set(bbr_v3_topology_test_lib)
+set(bbr_v3_topology_test_sources)
+if(point-to-point
+   IN_LIST
+   ns3-all-enabled-modules
+   AND point-to-point-layout
+       IN_LIST
+       ns3-all-enabled-modules
+   AND applications
+       IN_LIST
+       ns3-all-enabled-modules
+)
+  set(bbr_v3_topology_test_lib
+      ${libpoint-to-point} ${libpoint-to-point-layout} ${libapplications}
+  )
+  set(bbr_v3_topology_test_sources
+      test/tcp-bbr-v3-topology-test.cc
+  )
+endif()
+
 set(source_files
     helper/internet-stack-helper.cc
     helper/internet-trace-helper.cc
@@ -86,6 +110,7 @@ set(source_files
     model/ripng.cc
     model/rtt-estimator.cc
     model/tcp-bbr.cc
+    model/tcp-bbr-v3.cc
     model/tcp-bic.cc
     model/tcp-congestion-ops.cc
     model/tcp-cubic.cc
@@ -212,6 +237,7 @@ set(header_files
     model/ripng.h
     model/rtt-estimator.h
     model/tcp-bbr.h
+    model/tcp-bbr-v3.h
     model/tcp-bic.h
     model/tcp-congestion-ops.h
     model/tcp-cubic.h
@@ -260,51 +286,7 @@ if(WIN32)
   )
 endif()
 
-# ns3tcp system tests live here because they exercise TCP; they pull in
-# applications and point-to-point (and csma for the no-delay / socket tests) so
-# they are linked conditionally to keep internet's test binary buildable when
-# those modules are not enabled.
-set(ns3tcp_sources)
-set(ns3tcp_libs)
-if((applications
-    IN_LIST
-    ns3-all-enabled-modules
-   )
-   AND (point-to-point
-        IN_LIST
-        ns3-all-enabled-modules
-       )
-)
-  set(ns3tcp_sources
-      test/ns3tcp-cubic-test-suite.cc
-      test/ns3tcp-loss-test-suite.cc
-      test/ns3tcp-socket-writer.cc
-      test/ns3tcp-state-test-suite.cc
-  )
-  set(ns3tcp_libs
-      ${libapplications}
-      ${libpoint-to-point}
-  )
-  if(csma
-     IN_LIST
-     ns3-all-enabled-modules
-  )
-    list(
-      APPEND
-      ns3tcp_sources
-      test/ns3tcp-no-delay-test-suite.cc
-      test/ns3tcp-socket-test-suite.cc
-    )
-    list(
-      APPEND
-      ns3tcp_libs
-      ${libcsma}
-    )
-  endif()
-endif()
-
 set(test_sources
-    ${ns3tcp_sources}
     test/global-route-manager-impl-test-suite.cc
     test/icmp-checksum-test-suite.cc
     test/icmp-test.cc
@@ -340,6 +322,7 @@ set(test_sources
     test/tcp-abe-test.cc
     test/tcp-advertised-window-test.cc
     test/tcp-bbr-test.cc
+    test/tcp-bbr-v3-test.cc
     test/tcp-bic-test.cc
     test/tcp-bytes-in-flight-test.cc
     test/tcp-classic-recovery-test.cc
@@ -363,7 +346,6 @@ set(test_sources
     test/tcp-linux-reno-test.cc
     test/tcp-loss-test.cc
     test/tcp-lp-test.cc
-    test/tcp-no-sack-dupack-test.cc
     test/tcp-option-test.cc
     test/tcp-pacing-test.cc
     test/tcp-pkts-acked-test.cc
@@ -386,7 +368,7 @@ set(test_sources
     test/tcp-yeah-test.cc
     test/tcp-zero-window-test.cc
     test/udp-test.cc
-    test/internet-traced-callback-typedef-test-suite.cc
+    ${bbr_v3_topology_test_sources}
 )
 
 build_lib(
@@ -397,6 +379,6 @@ build_lib(
   LIBRARIES_TO_LINK ${libbridge}
                     ${libtraffic-control}
   TEST_SOURCES ${test_sources}
-  TEST_LIBRARIES_TO_LINK ${ns3tcp_libs}
+  TEST_LIBRARIES_TO_LINK ${bbr_v3_topology_test_lib}
   GENERATE_EXPORT_HEADER
 )

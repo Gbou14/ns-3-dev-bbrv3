@@ -68,6 +68,12 @@ class TcpTxItem
     const Time& GetLastSent() const;
 
     /**
+     * @brief Get the sequence number just past the end of the item.
+     * @return the start sequence number plus the item size
+     */
+    SequenceNumber32 GetSeqEnd() const;
+
+    /**
      * @brief Various rate-related information, can be accessed by TcpRateOps.
      *
      * Note: This is not enforced through C++, but you developer must honour
@@ -81,6 +87,8 @@ class TcpTxItem
         Time m_firstSent{
             Time::Max()}; //!< Connection's first sent time at the time the packet was sent
         bool m_isAppLimited{false}; //!< Connection's app limited at the time the packet was sent
+        uint64_t m_lost{0}; //!< Connection's cumulative lost bytes at the time the packet was sent
+        uint32_t m_inFlight{0}; //!< Bytes in flight (including this packet) when it was sent
     };
 
     /**

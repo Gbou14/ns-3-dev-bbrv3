@@ -82,6 +82,12 @@ TcpTxItem::GetLastSent() const
     return m_lastSent;
 }
 
+SequenceNumber32
+TcpTxItem::GetSeqEnd() const
+{
+    return m_startSeq + GetSeqSize();
+}
+
 TcpTxItem::RateInformation&
 TcpTxItem::GetRateInformation()
 {

@@ -76,6 +76,16 @@ TcpTxBuffer::HeadSequence() const
     return m_firstByteSeq;
 }
 
+Time
+TcpTxBuffer::HeadSentTime() const
+{
+    if (m_sentList.empty())
+    {
+        return Seconds(-1);
+    }
+    return m_sentList.front()->GetLastSent();
+}
+
 SequenceNumber32
 TcpTxBuffer::TailSequence() const
 {
@@ -140,6 +150,12 @@ uint32_t
 TcpTxBuffer::GetLost() const
 {
     return m_lostOut;
+}
+
+uint64_t
+TcpTxBuffer::GetTotalLost() const
+{
+    return m_lostTotal;
 }
 
 uint32_t
@@ -739,18 +755,13 @@ TcpTxBuffer::DiscardUpTo(const SequenceNumber32& seq, const Callback<void, TcpTx
         {
             NS_ASSERT(!head->m_lost);
             // It is not possible to have the UNA sacked; otherwise, it would
-            // have been ACKed. This is, most likely, incorrect guessing
+            // have been ACKed. This is, most likely, our wrong guessing
             // when adding Reno dupacks in the count.
             head->m_sacked = false;
             m_sackedOut -= head->m_packet->GetSize();
             NS_LOG_INFO("Moving the SACK flag from the HEAD to another segment");
             AddRenoSack();
-            // Without SACK, the socket decides whether the head is lost,
-            // because that depends on the congestion state
-            if (m_sackEnabled)
-            {
-                MarkHeadAsLost();
-            }
+            MarkHeadAsLost();
         }
 
         NS_ASSERT_MSG(head->m_startSeq == seq,
@@ -912,6 +923,7 @@ TcpTxBuffer::UpdateLostCount()
             {
                 item->m_lost = true;
                 m_lostOut += item->m_packet->GetSize();
+                NotifyLost(item);
             }
         }
         beginOfCurrentPacket -= item->m_packet->GetSize();
@@ -924,6 +936,7 @@ TcpTxBuffer::UpdateLostCount()
         {
             item->m_lost = true;
             m_lostOut += item->m_packet->GetSize();
+            NotifyLost(item);
         }
     }
     NS_LOG_INFO("Status after the update: " << *this);
@@ -952,6 +965,9 @@ TcpTxBuffer::MarkRetransmittedSegmentsLost(const Time& sackedSentTime)
                 item->m_lost = true;
                 m_lostOut += item->m_packet->GetSize();
             }
+            // A lost retransmission is a new loss, as in Linux's
+            // tcp_mark_skb_lost() (LINUX_MIB_TCPLOSTRETRANSMIT).
+            NotifyLost(item);
             NS_LOG_INFO("Retransmission of segment " << *item << " deemed lost");
         }
         beginOfCurrentPacket += item->m_packet->GetSize();
@@ -1256,6 +1272,22 @@ TcpTxBuffer::ResetRenoSack()
 }
 
 void
+TcpTxBuffer::SetSkbLostCallback(Callback<void, TcpTxItem*> lostCb)
+{
+    m_skbLostCb = lostCb;
+}
+
+void
+TcpTxBuffer::NotifyLost(TcpTxItem* item)
+{
+    m_lostTotal += item->m_packet->GetSize();
+    if (!m_skbLostCb.IsNull())
+    {
+        m_skbLostCb(item);
+    }
+}
+
+void
 TcpTxBuffer::SetRWndCallback(Callback<uint32_t> rWndCallback)
 {
     NS_LOG_FUNCTION(this);
@@ -1326,8 +1358,13 @@ TcpTxBuffer::SetSentListLost(bool resetSack)
     {
         if (resetSack)
         {
+            bool wasLost = (*it)->m_lost;
             (*it)->m_sacked = false;
             (*it)->m_lost = true;
+            if (!wasLost)
+            {
+                NotifyLost(*it);
+            }
         }
         else
         {
@@ -1341,6 +1378,7 @@ TcpTxBuffer::SetSentListLost(bool resetSack)
                 // Packet is not marked lost, nor is sacked. Then it becomes lost.
                 (*it)->m_lost = true;
                 m_lostOut += (*it)->m_packet->GetSize();
+                NotifyLost(*it);
             }
         }
 
@@ -1407,6 +1445,7 @@ TcpTxBuffer::MarkHeadAsLost()
         {
             m_sentList.front()->m_lost = true;
             m_lostOut += m_sentList.front()->m_packet->GetSize();
+            NotifyLost(m_sentList.front());
         }
     }
     ConsistencyCheck();

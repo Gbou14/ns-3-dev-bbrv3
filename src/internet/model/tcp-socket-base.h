@@ -34,6 +34,7 @@ class TcpL4Protocol;
 class TcpHeader;
 class TcpCongestionOps;
 class TcpRecoveryOps;
+class TcpTxItem;
 class RttEstimator;
 class TcpRxBuffer;
 class TcpTxBuffer;
@@ -1080,6 +1081,36 @@ class TcpSocketBase : public TcpSocket
     virtual uint32_t AvailableWindow() const;
 
     /**
+     * @brief Decide whether to hold back a partial burst of new data, as
+     * Linux's tcp_tso_should_defer() holds back a TSO skb smaller than its
+     * full size until more ACKs arrive. Only used with a send quantum larger
+     * than one segment.
+     *
+     * @param limit bytes the window lets out now
+     * @param quantum full burst size, in bytes
+     * @return true if the burst should wait
+     */
+    bool TsoShouldDefer(uint32_t limit, uint32_t quantum) const;
+
+    /**
+     * @brief Track whether the cwnd limited sending in the current window
+     * of data, as Linux's tcp_cwnd_validate() keeps tp->is_cwnd_limited.
+     *
+     * @param isCwndLimited whether this send attempt was limited by cwnd
+     * @param sent whether any data was sent
+     */
+    void CwndValidate(bool isCwndLimited, bool sent);
+
+    /**
+     * @brief Start the pacing timer for data just sent. With a send quantum
+     * (Linux-style bursts), a send later than pacing allowed gets back up to
+     * half its pacing time, as Linux's tcp_update_skb_after_send() does.
+     *
+     * @param bytes bytes just sent
+     */
+    void SchedulePacing(uint32_t bytes);
+
+    /**
      * @brief The amount of Rx window announced to the peer
      * @param scale indicate if the window should be scaled. True for
      * almost all cases, except when we are sending a SYN
@@ -1157,6 +1188,18 @@ class TcpSocketBase : public TcpSocket
      * @param tcpHeader the packet's TCP header
      */
     virtual void EstimateRtt(const TcpHeader& tcpHeader);
+
+    /**
+     * @brief Retransmission timeout from the current RTT estimate.
+     * @return the RTO, per RFC 6298 or, with the LinuxRto attribute, per Linux
+     */
+    Time ComputeRto() const;
+
+    /**
+     * @brief Pass a segment just marked lost to the congestion control.
+     * @param item the segment
+     */
+    void NotifySkbLost(TcpTxItem* item);
 
     /**
      * @brief Update the RTT history, when we send TCP segments
@@ -1403,8 +1446,12 @@ class TcpSocketBase : public TcpSocket
     uint32_t m_dataRetries{0};   //!< Number of data retransmission attempts
 
     // Timeouts
-    TracedValue<Time> m_rto;                 //!< Retransmit timeout
-    Time m_minRto{Time::Max()};              //!< minimum value of the Retransmit timeout
+    TracedValue<Time> m_rto;     //!< Retransmit timeout
+    Time m_minRto{Time::Max()};  //!< minimum value of the Retransmit timeout
+    bool m_linuxRto{false};      //!< Compute and restart the retransmission timer as Linux does
+    bool m_inPacingBurst{false}; //!< SendPendingData() is sending a paced burst
+    uint32_t m_maxBytesOut{0};   //!< Most data outstanding in the current window (max_packets_out)
+    SequenceNumber32 m_cwndUsageSeq{0};      //!< End of the current window (cwnd_usage_seq)
     Time m_clockGranularity{Seconds(0.001)}; //!< Clock Granularity used in RTO calcs
     Time m_delAckTimeout;                    //!< Time to delay an ACK
     Time m_persistTimeout;                   //!< Time between sending 1-byte probes

@@ -10,7 +10,7 @@
 #define NS_LOG_APPEND_CONTEXT                                                                      \
     if (m_node)                                                                                    \
     {                                                                                              \
-        ns3LogStream << " [node " << m_node->GetId() << "] ";                                      \
+        std::clog << " [node " << m_node->GetId() << "] ";                                         \
     }
 
 #include "tcp-socket-base.h"
@@ -151,6 +151,15 @@ TcpSocketBase::GetTypeId()
                 // See http://www.postel.org/pipermail/end2end-interest/2004-November/004402.html
                 MakeTimeAccessor(&TcpSocketBase::SetMinRto, &TcpSocketBase::GetMinRto),
                 MakeTimeChecker())
+            .AddAttribute("LinuxRto",
+                          "Compute and restart the retransmission timer as Linux does: "
+                          "RTO = SRTT + max(4 * RTTVAR, MinRto) (tcp_rtt_estimator(), "
+                          "__tcp_set_rto()), restarted when the first unacknowledged segment "
+                          "is retransmitted (tcp_xmit_retransmit_queue()). If false, RFC 6298: "
+                          "RTO = max(SRTT + max(G, 4 * RTTVAR), MinRto), restarted on new ACKs.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&TcpSocketBase::m_linuxRto),
+                          MakeBooleanChecker())
             .AddAttribute(
                 "ClockGranularity",
                 "Clock Granularity used in RTO calculations",
@@ -310,6 +319,7 @@ TcpSocketBase::TcpSocketBase()
 
     m_txBuffer = CreateObject<TcpTxBuffer>();
     m_txBuffer->SetRWndCallback(MakeCallback(&TcpSocketBase::GetRWnd, this));
+    m_txBuffer->SetSkbLostCallback(MakeCallback(&TcpSocketBase::NotifySkbLost, this));
     m_tcb = CreateObject<TcpSocketState>();
     m_rateOps = CreateObject<TcpRateLinux>();
 
@@ -454,6 +464,7 @@ TcpSocketBase::TcpSocketBase(const TcpSocketBase& sock)
     SetRecvCallback(vPS);
     m_txBuffer = CopyObject(sock.m_txBuffer);
     m_txBuffer->SetRWndCallback(MakeCallback(&TcpSocketBase::GetRWnd, this));
+    m_txBuffer->SetSkbLostCallback(MakeCallback(&TcpSocketBase::NotifySkbLost, this));
     m_tcb = CopyObject(sock.m_tcb);
     m_tcb->m_rxBuffer = CopyObject(sock.m_tcb->m_rxBuffer);
 
@@ -1941,7 +1952,7 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
     NS_ASSERT(0 != (tcpHeader.GetFlags() & TcpHeader::ACK));
     NS_ASSERT(m_tcb->m_segmentSize > 0);
 
-    uint32_t previousLost = m_txBuffer->GetLost();
+    uint64_t previousLost = m_txBuffer->GetTotalLost();
     uint32_t priorInFlight = m_tcb->m_bytesInFlight.Get();
 
     // RFC 6675, Section 5, 1st paragraph:
@@ -1949,6 +1960,7 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
     // scoreboard MUST be updated via the Update () routine (done in ReadOptions)
     uint32_t bytesSacked = 0;
     uint64_t previousDelivered = m_rateOps->GetConnectionRate().m_delivered;
+    m_rateOps->StartSample();
     ReadOptions(tcpHeader, &bytesSacked);
 
     SequenceNumber32 ackNumber = tcpHeader.GetAckNumber();
@@ -1979,24 +1991,6 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
     }
 
     m_txBuffer->DiscardUpTo(ackNumber, MakeCallback(&TcpRateOps::SkbDelivered, m_rateOps));
-
-    // Without SACK, the guessed SACKs only have meaning during fast recovery
-    if (!m_sackEnabled && ackNumber > oldHeadSequence)
-    {
-        if (m_tcb->m_congState == TcpSocketState::CA_RECOVERY && ackNumber < m_recover)
-        {
-            // Partial ACK: the next segment is presumed lost (RFC 6582)
-            // and will be retransmitted
-            NS_LOG_INFO("Partial ACK. Manually setting head as lost");
-            m_txBuffer->MarkHeadAsLost();
-        }
-        else
-        {
-            // A cumulative ACK that advances outside of fast recovery,
-            // or that ends it, clears the guesses
-            m_txBuffer->ResetRenoSack();
-        }
-    }
 
     auto currentDelivered =
         static_cast<uint32_t>(m_rateOps->GetConnectionRate().m_delivered - previousDelivered);
@@ -2051,14 +2045,20 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
 
     if (m_congestionControl->HasCongControl())
     {
-        uint32_t currentLost = m_txBuffer->GetLost();
-        uint32_t lost =
-            (currentLost > previousLost) ? currentLost - previousLost : previousLost - currentLost;
+        // Bytes freshly marked lost by this ACK. GetLost() can't be used
+        // here: it also drops when lost segments are SACKed or cumulatively
+        // ACKed, which would be misreported as new losses.
+        auto lost = static_cast<uint32_t>(m_txBuffer->GetTotalLost() - previousLost);
         auto rateSample = m_rateOps->GenerateSample(currentDelivered,
                                                     lost,
                                                     false,
                                                     priorInFlight,
                                                     m_tcb->m_minRtt);
+        if (rateSample.m_delivered >= 0)
+        {
+            rateSample.m_lost =
+                static_cast<uint32_t>(m_txBuffer->GetTotalLost() - rateSample.m_priorLost);
+        }
         auto rateConn = m_rateOps->GetConnectionRate();
         m_congestionControl->CongControl(m_tcb, rateConn, rateSample);
     }
@@ -2204,6 +2204,13 @@ TcpSocketBase::ProcessAck(const SequenceNumber32& ackNumber,
         // the CA_RECOVERY phase. Just process this partial ack (RFC 5681)
         if (ackNumber < m_recover && m_tcb->m_congState == TcpSocketState::CA_RECOVERY)
         {
+            if (!m_sackEnabled)
+            {
+                // Manually set the head as lost, it will be retransmitted.
+                NS_LOG_INFO("Partial ACK. Manually setting head as lost");
+                m_txBuffer->MarkHeadAsLost();
+            }
+
             // Before retransmitting the packet perform DoRecovery and check if
             // there is available window
             if (!m_congestionControl->HasCongControl() && segsAcked >= 1)
@@ -2360,7 +2367,10 @@ TcpSocketBase::ProcessAck(const SequenceNumber32& ackNumber,
             if (exitedFastRecovery)
             {
                 NewAck(ackNumber, true);
-                m_tcb->m_cWnd = m_tcb->m_ssThresh.Get();
+                if (!m_congestionControl->HasCongControl())
+                {
+                    m_tcb->m_cWnd = m_tcb->m_ssThresh.Get();
+                }
                 m_recoveryOps->ExitRecovery(m_tcb);
                 NS_LOG_INFO("Exit CA_RECOVERY -> CA_OPEN: ack "
                             << ackNumber << " reached recover " << m_recover << "; cWnd "
@@ -3312,6 +3322,10 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     TcpTxItem* outItem = m_txBuffer->CopyFromSequence(maxSize, seq);
 
     m_rateOps->SkbSent(outItem, isStartOfTransmission);
+    outItem->GetRateInformation().m_lost = m_txBuffer->GetTotalLost();
+    // outItem is already in the sent list, so this includes it. Query the
+    // buffer directly: BytesInFlight() would also fire the bytes-in-flight trace.
+    outItem->GetRateInformation().m_inFlight = m_txBuffer->BytesInFlight();
 
     bool isRetransmission = outItem->IsRetrans();
     Ptr<Packet> p = outItem->GetPacketCopy();
@@ -3324,7 +3338,8 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     NS_ASSERT(isRetransmission ||
               ((m_highRxAckMark + SequenceNumber32(m_rWnd)) >= (seq + SequenceNumber32(maxSize))));
 
-    if (IsPacingEnabled())
+    // Inside SendPendingData() the pacing timer is set once per burst, there.
+    if (IsPacingEnabled() && !m_inPacingBurst)
     {
         NS_LOG_INFO("Pacing is enabled");
         if (m_pacingTimer.IsExpired())
@@ -3332,7 +3347,7 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
             NS_LOG_DEBUG("Current Pacing Rate " << m_tcb->m_pacingRate);
             NS_LOG_DEBUG("Timer is in expired state, activate it "
                          << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-            m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
+            SchedulePacing(sz);
         }
         else
         {
@@ -3394,10 +3409,15 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     header.SetWindowSize(AdvertisedWindowSize());
     AddOptions(header);
 
-    if (m_retxEvent.IsExpired())
+    // Linux restarts the timer when it retransmits the head of the
+    // retransmission queue (tcp_xmit_retransmit_queue()), so a fast
+    // retransmission gets a full RTO to be acknowledged.
+    bool restartForHead = m_linuxRto && isRetransmission && seq == m_txBuffer->HeadSequence() &&
+                          m_retxEvent.IsPending();
+    if (m_retxEvent.IsExpired() || restartForHead)
     {
         // Schedules retransmit timeout. m_rto should be already doubled.
-
+        m_retxEvent.Cancel();
         NS_LOG_LOGIC(this << " SendDataPacket Schedule ReTxTimeout at time "
                           << Simulator::Now().GetSeconds() << " to expire at time "
                           << (Simulator::Now() + m_rto.Get()).GetSeconds());
@@ -3519,6 +3539,17 @@ TcpSocketBase::SendPendingData(bool withAck)
     uint32_t nPacketsSent = 0;
     uint32_t availableWindow = AvailableWindow();
 
+    // With pacing, up to m_sendQuantum bytes go out back to back and the
+    // pacing timer then waits for the whole burst's transmission time at the
+    // pacing rate, as Linux paces each TSO/GSO skb by its length. The default
+    // (0) ends the burst after every segment.
+    uint32_t burstBytes = 0;
+    uint32_t quantum = std::max<uint32_t>(m_tcb->m_sendQuantum, 1);
+    m_inPacingBurst = IsPacingEnabled();
+    bool deferredForCwnd = false; // TSO deferral waited for cwnd (Linux is_cwnd_limited)
+    bool burstRetx = false;       // the burst so far carries retransmitted data
+    SequenceNumber32 burstEnd;    // sequence after the burst so far
+
     // RFC 6675, Section (C)
     // If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
     // segments as follows:
@@ -3557,6 +3588,24 @@ TcpSocketBase::SendPendingData(bool withAck)
         }
         else
         {
+            // A burst stands for one Linux skb: retransmitted and new data never
+            // share one, and a retransmission covers one contiguous lost range
+            // (tcp_xmit_retransmit_queue() sends each rtx-queue skb on its own,
+            // trimmed by __tcp_retransmit_skb(), before tcp_write_xmit() sends
+            // new data). So end the burst there; it is paced after the loop.
+            bool isRetx = next < m_tcb->m_highTxMark.Get();
+            if (burstBytes > 0 && (isRetx != burstRetx || next != burstEnd))
+            {
+                break;
+            }
+            if (burstBytes == 0 && !isRetx && quantum > m_tcb->m_segmentSize && IsPacingEnabled() &&
+                TsoShouldDefer(availableWindow, quantum))
+            {
+                NS_LOG_LOGIC("Deferring a partial burst of " << availableWindow << " bytes");
+                deferredForCwnd = m_tcb->m_cWnd.Get() < m_rWnd.Get();
+                break;
+            }
+
             // It's time to transmit, but before do silly window and Nagle's check
             uint32_t availableData = m_txBuffer->SizeFromSequence(next);
 
@@ -3617,15 +3666,20 @@ TcpSocketBase::SendPendingData(bool withAck)
                                   << " sent seq " << m_tcb->m_nextTxSequence << " size " << sz);
             m_tcb->m_nextTxSequence += sz;
             ++nPacketsSent;
+            burstRetx = isRetx;
+            burstEnd = next + sz;
             if (IsPacingEnabled())
             {
                 NS_LOG_INFO("Pacing is enabled");
-                if (m_pacingTimer.IsExpired())
+                burstBytes += sz;
+                if (burstBytes >= quantum && m_pacingTimer.IsExpired())
                 {
                     NS_LOG_DEBUG("Current Pacing Rate " << m_tcb->m_pacingRate);
-                    NS_LOG_DEBUG("Timer is in expired state, activate it "
-                                 << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
-                    m_pacingTimer.Schedule(m_tcb->m_pacingRate.Get().CalculateBytesTxTime(sz));
+                    NS_LOG_DEBUG("Burst of "
+                                 << burstBytes << " bytes sent, activate timer "
+                                 << m_tcb->m_pacingRate.Get().CalculateBytesTxTime(burstBytes));
+                    SchedulePacing(burstBytes);
+                    burstBytes = 0;
                     break;
                 }
             }
@@ -3640,6 +3694,16 @@ TcpSocketBase::SendPendingData(bool withAck)
 
         // (C.5) If cwnd - pipe >= 1 SMSS, return to (C.1)
         // loop again!
+    }
+
+    m_inPacingBurst = false;
+    CwndValidate(deferredForCwnd || m_tcb->m_cWnd < BytesInFlight() + m_tcb->m_segmentSize,
+                 nPacketsSent > 0);
+    if (burstBytes > 0 && m_pacingTimer.IsExpired())
+    {
+        // A burst cut short by the window or the data still waits for its own
+        // transmission time.
+        SchedulePacing(burstBytes);
     }
 
     if (nPacketsSent > 0)
@@ -3684,6 +3748,82 @@ uint32_t
 TcpSocketBase::Window() const
 {
     return std::min(m_rWnd.Get(), m_tcb->m_cWnd.Get());
+}
+
+void
+TcpSocketBase::SchedulePacing(uint32_t bytes)
+{
+    Time now = Simulator::Now();
+    Time len = m_tcb->m_pacingRate.Get().CalculateBytesTxTime(bytes);
+    if (m_tcb->m_sendQuantum > 0 && now > m_tcb->m_pacingRelease)
+    {
+        // Linux tcp_update_skb_after_send(): if this send is later than
+        // pacing allowed (for example after waiting for an ACK), take back
+        // the delay, up to half this skb's pacing time ("OS jitter" credit).
+        len -= std::min(len / 2, now - m_tcb->m_pacingRelease);
+    }
+    m_pacingTimer.Schedule(len);
+    m_tcb->m_pacingRelease = now + len;
+}
+
+bool
+TcpSocketBase::TsoShouldDefer(uint32_t limit, uint32_t quantum) const
+{
+    // Linux tcp_tso_should_defer(), tcp_output.c. The skb-tail test is left
+    // out: a bulk sender's queued skb is already a full burst, so it is the
+    // same as the full-burst test.
+    if (m_tcb->m_congState >= TcpSocketState::CA_RECOVERY)
+    {
+        return false;
+    }
+    // Defer only if the last burst was recent (tcp_wstamp_ns within 1 ms).
+    Time now = Simulator::Now();
+    if (now - m_tcb->m_pacingRelease > MilliSeconds(1))
+    {
+        return false;
+    }
+    if (limit >= quantum)
+    {
+        return false;
+    }
+    // tcp_tso_win_divisor (3): send if a third of the window is available.
+    uint32_t chunk = std::min<uint32_t>(m_rWnd.Get(), m_tcb->m_cWnd.Get()) / 3;
+    if (limit >= chunk)
+    {
+        return false;
+    }
+    // If the next ACK is likely to come too late (half srtt), do not defer.
+    Time head = m_txBuffer->HeadSentTime();
+    if (head.IsNegative() || now - head < m_tcb->m_srtt.Get() / 2)
+    {
+        return false;
+    }
+    // A FIN would follow this data, so it will get no more: do not wait.
+    if (m_closeOnEmpty && m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence) <= limit)
+    {
+        return false;
+    }
+    return true;
+}
+
+void
+TcpSocketBase::CwndValidate(bool isCwndLimited, bool sent)
+{
+    // Linux tcp_cwnd_validate(), called at the end of tcp_write_xmit(): once
+    // a send is cwnd-limited, that holds until the window of data sent so
+    // far is acknowledged; otherwise track the most data outstanding.
+    if (!sent && !isCwndLimited)
+    {
+        return;
+    }
+    uint32_t out = m_tcb->m_highTxMark.Get() - m_txBuffer->HeadSequence();
+    if (m_txBuffer->HeadSequence() >= m_cwndUsageSeq || isCwndLimited ||
+        (!m_tcb->m_cwndLimitedInWindow && out > m_maxBytesOut))
+    {
+        m_tcb->m_cwndLimitedInWindow = isCwndLimited;
+        m_maxBytesOut = out;
+        m_cwndUsageSeq = m_tcb->m_highTxMark;
+    }
 }
 
 uint32_t
@@ -3876,7 +4016,16 @@ TcpSocketBase::CalculateRttSample(const TcpHeader& tcpHeader, const RttHistory& 
         // segments is when the TCP timestamp option is employed, since
         // the timestamp option removes the ambiguity regarding which instance
         // of the data segment triggered the acknowledgment.
-        if (m_timestampEnabled && tcpHeader.HasOption(TcpOption::TS))
+        //
+        // Like Linux (tcp_ack_update_rtt(): "Prefer RTT measured from ACK's
+        // timing to TS-ECR"), the transmit time is used when the segment was
+        // not retransmitted; the timestamp option only has millisecond
+        // resolution here.
+        if (!rttHistory.retx)
+        {
+            rtt = Simulator::Now() - rttHistory.time;
+        }
+        else if (m_timestampEnabled && tcpHeader.HasOption(TcpOption::TS))
         {
             Ptr<const TcpOptionTS> ts;
             ts = DynamicCast<const TcpOptionTS>(tcpHeader.GetOption(TcpOption::TS));
@@ -3889,13 +4038,33 @@ TcpSocketBase::CalculateRttSample(const TcpHeader& tcpHeader, const RttHistory& 
                 rtt = MicroSeconds(1);
             }
         }
-        else if (!rttHistory.retx)
-        {
-            // Elapsed time since the packet was transmitted
-            rtt = Simulator::Now() - rttHistory.time;
-        }
     }
     return rtt;
+}
+
+void
+TcpSocketBase::NotifySkbLost(TcpTxItem* item)
+{
+    if (m_congestionControl)
+    {
+        m_congestionControl->SkbMarkedLost(m_tcb,
+                                           item->GetRateInformation(),
+                                           item->GetSeqSize(),
+                                           m_txBuffer->GetTotalLost());
+    }
+}
+
+Time
+TcpSocketBase::ComputeRto() const
+{
+    if (m_linuxRto)
+    {
+        // Linux keeps rttvar_us >= tcp_rto_min, so the minimum bounds the
+        // variance term rather than the whole timeout.
+        return m_rtt->GetEstimate() + Max(m_rtt->GetVariation() * 4, m_minRto);
+    }
+    // RFC 6298, clause 2.4
+    return Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4), m_minRto);
 }
 
 void
@@ -3943,9 +4112,7 @@ TcpSocketBase::EstimateRtt(const TcpHeader& tcpHeader)
     if (!rtt.IsZero())
     {
         m_rtt->Measurement(rtt); // Log the measurement
-        // RFC 6298, clause 2.4
-        m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
-                    m_minRto);
+        m_rto = ComputeRto();
         m_tcb->m_srtt = m_rtt->GetEstimate();
         m_tcb->m_minRtt = std::min(m_tcb->m_srtt.Get(), m_tcb->m_minRtt);
         NS_LOG_INFO(this << m_tcb->m_srtt << m_tcb->m_minRtt);
@@ -3977,9 +4144,7 @@ TcpSocketBase::NewAck(const SequenceNumber32& ack, bool resetRTO)
                  << (Simulator::Now() + Simulator::GetDelayLeft(m_retxEvent)).GetSeconds());
         m_retxEvent.Cancel();
         // On receiving a "New" ack we restart retransmission timer .. RFC 6298
-        // RFC 6298, clause 2.4
-        m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
-                    m_minRto);
+        m_rto = ComputeRto();
 
         NS_LOG_LOGIC(this << " Schedule ReTxTimeout at time " << Simulator::Now().GetSeconds()
                           << " to expire at time "
@@ -4179,36 +4344,19 @@ TcpSocketBase::LastAckTimeout()
     }
 }
 
-// Send 1-byte data (or a zero-length segment, if there is no unsent data) to
-// probe for the window size at the receiver when the local knowledge tells
-// that the receiver has zero window size
-// C.f.: RFC793 p.42, RFC1122 sec.4.2.2.17, RFC9293 sec.3.8.6.1
+// Send 1-byte data to probe for the window size at the receiver when
+// the local knowledge tells that the receiver has zero window size
+// C.f.: RFC793 p.42, RFC1112 sec.4.2.2.17
 void
 TcpSocketBase::PersistTimeout()
 {
     NS_LOG_LOGIC("PersistTimeout expired at " << Simulator::Now().GetSeconds());
     m_persistTimeout =
         std::min(Seconds(60), Time(2 * m_persistTimeout)); // max persist timeout = 60s
-    // CopyFromSequence() returns nullptr when there is no unsent data. In that
-    // case, send a zero-length probe with an already acknowledged sequence
-    // number. The receiver finds it unacceptable and must answer with an ACK
-    // carrying its current window (@RFC{9293} sec 3.10.7.4, @issueid{1326}).
-    Ptr<Packet> p;
-    SequenceNumber32 probeSeq = m_tcb->m_nextTxSequence;
-    TcpTxItem* outItem = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence);
-    if (outItem != nullptr)
-    {
-        p = outItem->GetPacketCopy();
-        // The probe byte is not accounted as sent; return it to the unsent data
-        m_txBuffer->ResetLastSegmentSent();
-    }
-    else
-    {
-        p = Create<Packet>();
-        probeSeq = m_txBuffer->HeadSequence() - 1;
-    }
+    Ptr<Packet> p = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence)->GetPacketCopy();
+    m_txBuffer->ResetLastSegmentSent();
     TcpHeader tcpHeader;
-    tcpHeader.SetSequenceNumber(probeSeq);
+    tcpHeader.SetSequenceNumber(m_tcb->m_nextTxSequence);
     tcpHeader.SetAckNumber(m_tcb->m_rxBuffer->NextRxSequence());
     tcpHeader.SetWindowSize(AdvertisedWindowSize());
     if (m_endPoint != nullptr)

@@ -126,12 +126,12 @@ TcpBbrV3CheckGainValuesTest::ExecuteTest()
     case TcpBbrV3::BBR_STARTUP:
         cong->EnterStartup();
         desiredPacingGain = m_highGain;
-        desiredCwndGain = m_highGain;
+        desiredCwndGain = 2.0;
         break;
     case TcpBbrV3::BBR_DRAIN:
         cong->EnterDrain();
-        desiredPacingGain = 1 / m_highGain;
-        desiredCwndGain = m_highGain;
+        desiredPacingGain = 0.5;
+        desiredCwndGain = 2.0;
         break;
     case TcpBbrV3::BBR_PROBE_RTT:
         cong->EnterProbeRTT();
@@ -212,7 +212,7 @@ TcpBbrV3ProbeBwSubStateTest::ExecuteTest()
     switch (m_phase)
     {
     case TcpBbrV3::BBR_BW_PROBE_DOWN:
-        desiredPacingGain = 0.91;
+        desiredPacingGain = 0.90;
         break;
     case TcpBbrV3::BBR_BW_PROBE_REFILL:
         cong->StartBwProbeRefill(0);
@@ -332,21 +332,19 @@ class TcpBbrV3TestSuite : public TestSuite
         AddTestCase(new TcpBbrV3PacingEnableTest(false, "BBRv3 must turn on pacing feature"),
                     TestCase::Duration::QUICK);
 
-        AddTestCase(
-            new TcpBbrV3CheckGainValuesTest(
-                TcpBbrV3::BBR_STARTUP,
-                2.89,
-                "BBRv3 should enter STARTUP and set cwnd and pacing gain to HighGain"),
-            TestCase::Duration::QUICK);
-        AddTestCase(
-            new TcpBbrV3CheckGainValuesTest(
-                TcpBbrV3::BBR_DRAIN,
-                2.89,
-                "BBRv3 should enter DRAIN and set pacing gain to the inverse of HighGain"),
-            TestCase::Duration::QUICK);
+        AddTestCase(new TcpBbrV3CheckGainValuesTest(
+                        TcpBbrV3::BBR_STARTUP,
+                        2.77,
+                        "BBRv3 should enter STARTUP with pacing gain HighGain and cwnd gain 2"),
+                    TestCase::Duration::QUICK);
+        AddTestCase(new TcpBbrV3CheckGainValuesTest(
+                        TcpBbrV3::BBR_DRAIN,
+                        2.77,
+                        "BBRv3 should enter DRAIN with pacing gain 0.5 and cwnd gain 2"),
+                    TestCase::Duration::QUICK);
         AddTestCase(
             new TcpBbrV3CheckGainValuesTest(TcpBbrV3::BBR_PROBE_RTT,
-                                            2.89,
+                                            2.77,
                                             "BBRv3 should enter PROBE_RTT with unity gains"),
             TestCase::Duration::QUICK);
 

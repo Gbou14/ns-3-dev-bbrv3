@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-
 #include "tcp-bbr-v3.h"
 
 #include "ns3/log.h"
 #include "ns3/simulator.h"
+
+#include <limits>
 
 namespace ns3
 {
@@ -12,7 +13,8 @@ namespace ns3
 NS_LOG_COMPONENT_DEFINE("TcpBbrV3");
 NS_OBJECT_ENSURE_REGISTERED(TcpBbrV3);
 
-const double TcpBbrV3::PACING_GAIN_CYCLE[] = {1.25, 0.91, 1.0, 1.0}; // Linux: bbr_pacing_gain[]
+// DOWN is overridden by the ProbeBwDownGain attribute (draft-ietf-ccwg-bbr-06: 0.90, Linux: 0.91)
+const double TcpBbrV3::PACING_GAIN_CYCLE[] = {1.25, 0.90, 1.0, 1.0};
 
 const char* const TcpBbrV3::BbrModeName[BBR_PROBE_RTT + 1] = {
     "BBR_STARTUP",
@@ -40,23 +42,54 @@ TcpBbrV3::GetTypeId()
             .AddConstructor<TcpBbrV3>()
             .SetGroupName("Internet")
             .AddAttribute("HighGain",
-                          "Value of high gain",
-                          DoubleValue(2.89),
+                          "STARTUP pacing gain (Linux: bbr_startup_pacing_gain)",
+                          DoubleValue(2.77),
                           MakeDoubleAccessor(&TcpBbrV3::m_highGain),
                           MakeDoubleChecker<double>())
+            .AddAttribute("DrainGain",
+                          "DRAIN pacing gain (draft-ietf-ccwg-bbr-06: 0.5; Linux: 1/2.885)",
+                          DoubleValue(0.5),
+                          MakeDoubleAccessor(&TcpBbrV3::m_drainGain),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("ProbeBwDownGain",
+                          "PROBE_BW DOWN pacing gain (draft-ietf-ccwg-bbr-06: 0.90; Linux: 0.91)",
+                          DoubleValue(0.90),
+                          MakeDoubleAccessor(&TcpBbrV3::m_probeBwDownGain),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("DrainMaxRounds",
+                          "Rounds after which DRAIN exits even if inflight is still above the "
+                          "BDP; 0 disables the bound (draft-ietf-ccwg-bbr-06: 3; Linux: none)",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&TcpBbrV3::m_drainMaxRounds),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("TsoBursts",
+                          "Send in bursts sized as Linux BBR sizes TSO/GSO skbs "
+                          "(bbr_tso_segs(): about 1 ms of data at the pacing rate, at most "
+                          "64 KB, at least 2 segments), paced by burst length. If false, one "
+                          "segment per pacing interval. Off by default: in the nsperf comparison "
+                          "it moved ns-3 further from the kernel (see the fix log).",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&TcpBbrV3::m_tsoBursts),
+                          MakeBooleanChecker())
+            .AddAttribute("ExtraAckedRtts",
+                          "Rounds per slot of the two-slot extra_acked max filter "
+                          "(draft-ietf-ccwg-bbr-06 ExtraAckedFilterLen: 10; Linux: 5)",
+                          UintegerValue(10),
+                          MakeUintegerAccessor(&TcpBbrV3::m_extraAckedWinRttLength),
+                          MakeUintegerChecker<uint32_t>(1, 31))
             .AddAttribute("Stream",
                           "Random number stream (default is set to 4 to align with Linux results)",
                           UintegerValue(4),
                           MakeUintegerAccessor(&TcpBbrV3::SetStream),
                           MakeUintegerChecker<uint32_t>())
             .AddTraceSource("InternalState",
-                           "Internal BBRv3 state variables for logging",
-                           MakeTraceSourceAccessor(&TcpBbrV3::m_traceInternalState),
-                           "ns3::TcpBbrV3::InternalStateTracedCallback")
-            // The other v3-specific tunables (loss/ECN thresholds, beta, the
-            // bw-probe timing constants, etc.) are plain member defaults
-            // rather than ns-3 Attributes, so they aren't runtime-configurable
-            // without a code change.
+                            "Internal BBRv3 state variables for logging",
+                            MakeTraceSourceAccessor(&TcpBbrV3::m_traceInternalState),
+                            "ns3::TcpBbrV3::InternalStateTracedCallback")
+        // The other v3-specific tunables (loss/ECN thresholds, beta, the
+        // bw-probe timing constants, etc.) are plain member defaults
+        // rather than ns-3 Attributes, so they aren't runtime-configurable
+        // without a code change.
         ;
     return tid;
 }
@@ -78,11 +111,12 @@ TcpBbrV3::TcpBbrV3(const TcpBbrV3& sock)
       m_probeRttMin(sock.m_probeRttMin),
       m_probeRttMinStamp(sock.m_probeRttMinStamp),
       m_probeRttWinLen(sock.m_probeRttWinLen),
+      m_probeRttExpired(sock.m_probeRttExpired),
       m_roundCount(sock.m_roundCount),
       m_roundStart(sock.m_roundStart),
       m_nextRoundDelivered(sock.m_nextRoundDelivered),
       m_isPipeFilled(sock.m_isPipeFilled),
-      m_packetConservation(sock.m_packetConservation),
+      m_prevCaState(sock.m_prevCaState),
       m_fullBwCount(sock.m_fullBwCount),
       m_fullBw(sock.m_fullBw),
       m_fullBwNow(sock.m_fullBwNow),
@@ -93,6 +127,11 @@ TcpBbrV3::TcpBbrV3(const TcpBbrV3& sock)
       m_isInitialized(sock.m_isInitialized),
       m_uv(sock.m_uv),
       m_highGain(sock.m_highGain),
+      m_startupCwndGain(sock.m_startupCwndGain),
+      m_drainGain(sock.m_drainGain),
+      m_probeBwDownGain(sock.m_probeBwDownGain),
+      m_drainMaxRounds(sock.m_drainMaxRounds),
+      m_drainStartRound(sock.m_drainStartRound),
       m_delivered(sock.m_delivered),
       m_probeRttDoneStamp(sock.m_probeRttDoneStamp),
       m_idleRestart(sock.m_idleRestart),
@@ -112,6 +151,7 @@ TcpBbrV3::TcpBbrV3(const TcpBbrV3& sock)
       m_ackEpochTime(sock.m_ackEpochTime),
       m_ackEpochAcked(sock.m_ackEpochAcked),
       m_sendQuantum(sock.m_sendQuantum),
+      m_tsoBursts(sock.m_tsoBursts),
       m_hasSeenRtt(sock.m_hasSeenRtt),
       m_pacingMargin(sock.m_pacingMargin),
       m_lossInRound(sock.m_lossInRound),
@@ -132,6 +172,7 @@ TcpBbrV3::TcpBbrV3(const TcpBbrV3& sock)
       m_bwHi{sock.m_bwHi[0], sock.m_bwHi[1]},
       m_inflightLo(sock.m_inflightLo),
       m_inflightHi(sock.m_inflightHi),
+      m_segmentSize(sock.m_segmentSize),
       m_beta(sock.m_beta),
       m_lossThresh(sock.m_lossThresh),
       m_fullLossCnt(sock.m_fullLossCnt),
@@ -200,13 +241,36 @@ TcpBbrV3::GetProbeBwPhase() const
     return m_probeBwPhase;
 }
 
+TcpBbrV3::BbrInfo
+TcpBbrV3::GetBbrInfo() const
+{
+    BbrInfo info;
+    info.bw = Bw();
+    info.bwHi = MaxBw();
+    info.bwLo = m_bwLo;
+    info.minRtt = m_minRtt;
+    info.pacingGain = m_pacingGain;
+    info.cwndGain = m_cWndGain;
+    info.mode = m_state;
+    info.phase = m_probeBwPhase;
+    info.inflightLo = m_inflightLo;
+    info.inflightHi = m_inflightHi;
+    info.extraAcked = std::max(m_extraAcked[0], m_extraAcked[1]);
+    info.bwProbeSamples = m_bwProbeSamples;
+    info.prevProbeTooHigh = m_prevProbeTooHigh;
+    info.stoppedRiskyProbe = m_stoppedRiskyProbe;
+    info.ackPhase = m_ackPhase;
+    return info;
+}
+
 void
 TcpBbrV3::EnterStartup()
 {
     NS_LOG_FUNCTION(this);
     SetBbrState(BbrMode_t::BBR_STARTUP);
+    // Unlike v1 (2.89 for both), v3 uses separate STARTUP pacing and cwnd gains.
     m_pacingGain = m_highGain;
-    m_cWndGain = m_highGain;
+    m_cWndGain = m_startupCwndGain;
 }
 
 void
@@ -223,8 +287,9 @@ TcpBbrV3::EnterDrain()
 {
     NS_LOG_FUNCTION(this);
     SetBbrState(BbrMode_t::BBR_DRAIN);
-    m_pacingGain = 1.0 / m_highGain;
-    m_cWndGain = m_highGain;
+    m_pacingGain = m_drainGain;
+    m_cWndGain = m_startupCwndGain;
+    m_drainStartRound = m_roundCount;
 }
 
 void
@@ -232,7 +297,7 @@ TcpBbrV3::SetCycleIdx(BbrProbeBwPhase_t phase)
 {
     NS_LOG_FUNCTION(this << phase);
     NS_LOG_DEBUG(Simulator::Now() << " PROBE_BW phase " << ProbeBwPhaseName[m_probeBwPhase]
-                                   << " -> " << ProbeBwPhaseName[phase]);
+                                  << " -> " << ProbeBwPhaseName[phase]);
     m_probeBwPhase = phase;
     // The fast-path optimization (Linux's bbr_run_fast_path(), and the
     // try_fast_path flag it clears here) is intentionally not implemented
@@ -249,7 +314,7 @@ TcpBbrV3::StartBwProbeDown()
     m_cycleStamp = Simulator::Now();
     m_ackPhase = BBR_ACKS_PROBE_STOPPING;
     m_nextRoundDelivered = m_delivered;
-    m_pacingGain = PACING_GAIN_CYCLE[BBR_BW_PROBE_DOWN];
+    m_pacingGain = m_probeBwDownGain;
     m_cWndGain = 2;
     SetCycleIdx(BBR_BW_PROBE_DOWN);
 }
@@ -347,7 +412,7 @@ TcpBbrV3::LossLowerBounds(DataRate& bw, uint32_t& inflight)
     NS_LOG_FUNCTION(this << bw << inflight);
     double lossCut = 1.0 - m_beta;
     bw = DataRate(std::max<uint64_t>(m_bwLatest.GetBitRate(),
-                                      static_cast<uint64_t>(bw.GetBitRate() * lossCut)));
+                                     static_cast<uint64_t>(bw.GetBitRate() * lossCut)));
     inflight = std::max<uint32_t>(m_inflightLatest, static_cast<uint32_t>(inflight * lossCut));
 }
 
@@ -369,6 +434,7 @@ TcpBbrV3::AdaptLowerBounds(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
     {
         InitLowerBounds(tcb, true);
         LossLowerBounds(m_bwLo, m_inflightLo);
+        m_inflightLo = FloorSegments(m_inflightLo);
     }
 
     m_bwLo = std::max(DataRate(1), m_bwLo);
@@ -451,7 +517,6 @@ TcpBbrV3::UpdateRound(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& 
         m_nextRoundDelivered = m_delivered;
         m_roundCount++;
         m_roundStart = true;
-        m_packetConservation = false;
     }
     else
     {
@@ -494,8 +559,7 @@ TcpBbrV3::UpdateLatestDeliverySignals(Ptr<TcpSocketState> tcb, const TcpRateOps:
 }
 
 void
-TcpBbrV3::AdvanceLatestDeliverySignals(Ptr<TcpSocketState> tcb,
-                                       const TcpRateOps::TcpRateSample& rs)
+TcpBbrV3::AdvanceLatestDeliverySignals(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
 {
     NS_LOG_FUNCTION(this << tcb << rs);
     // Linux also checks !rs->is_acking_tlp_retrans_seq here; ns-3's
@@ -602,10 +666,12 @@ bool
 TcpBbrV3::IsInflightTooHigh(const TcpRateOps::TcpRateSample& rs) const
 {
     NS_LOG_FUNCTION(this << rs);
-    if (rs.m_bytesLoss > 0 && rs.m_priorInFlight > 0)
+    // Loss rate over the flight of the most recently delivered packet, not
+    // this ACK's freshly marked losses (Linux: rs->lost vs rs->losses).
+    if (rs.m_lost > 0 && rs.m_txInFlight > 0)
     {
-        auto lossThreshBytes = static_cast<uint32_t>(rs.m_priorInFlight * m_lossThresh);
-        if (rs.m_bytesLoss > lossThreshBytes)
+        auto lossThreshBytes = static_cast<uint32_t>(rs.m_txInFlight * m_lossThresh);
+        if (rs.m_lost > lossThreshBytes)
         {
             return true;
         }
@@ -624,7 +690,7 @@ TcpBbrV3::HandleQueueTooHighInStartup(Ptr<TcpSocketState> tcb)
     NS_LOG_DEBUG(Simulator::Now() << " STARTUP exit via loss/ECN short-circuit (not bw plateau)");
     m_isPipeFilled = true;
     uint32_t bdp = InFlight(tcb, MaxBw(), 1);
-    m_inflightHi = std::max(bdp, m_inflightLatest);
+    m_inflightHi = FloorSegments(std::max(bdp, m_inflightLatest));
 }
 
 void
@@ -644,8 +710,7 @@ TcpBbrV3::CheckLossTooHighInStartup(Ptr<TcpSocketState> tcb, const TcpRateOps::T
     {
         m_lossEventsInRound++; // saturating counter
     }
-    if (m_fullLossCnt > 0 && m_lossRoundStart &&
-        tcb->m_congState == TcpSocketState::CA_RECOVERY &&
+    if (m_fullLossCnt > 0 && m_lossRoundStart && tcb->m_congState == TcpSocketState::CA_RECOVERY &&
         m_lossEventsInRound >= m_fullLossCnt && IsInflightTooHigh(rs))
     {
         HandleQueueTooHighInStartup(tcb);
@@ -692,20 +757,26 @@ TcpBbrV3::CheckFullBwReached(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateS
     // CheckLossTooHighInStartup()/CheckEcnTooHighInStartup(); this function
     // implements only the bandwidth-plateau check.
     //
-    // Like v1's CheckFullPipe() and Linux's bbr_check_full_bw_reached(), this
-    // whole check runs at most once per round trip -- CongControl() (and
-    // hence this function) runs on every ACK, but the plateau/growth signal
-    // is only meaningful sampled once per round.
-    if (m_fullBwNow || !m_roundStart || rs.m_isAppLimited)
+    // Unlike v1's CheckFullPipe(), v3 looks for 25% bw growth on every ACK
+    // and only counts plateau rounds at round boundaries. Checking growth
+    // solely on the round-start sample declares a plateau too readily, which
+    // cuts PROBE_UP (and STARTUP) short.
+    if (m_fullBwNow || rs.m_isAppLimited)
     {
         return;
     }
 
+    // An invalid sample carries a stale m_deliveryRate; Linux uses bw 0 then.
+    DataRate sampleBw = rs.m_interval.IsZero() ? DataRate(0) : rs.m_deliveryRate;
     DataRate bwThresh(static_cast<uint64_t>(m_fullBw.GetBitRate() * 1.25));
-    if (rs.m_deliveryRate >= bwThresh)
+    if (sampleBw >= bwThresh)
     {
         ResetFullBw();
-        m_fullBw = rs.m_deliveryRate;
+        m_fullBw = sampleBw;
+        return;
+    }
+    if (!m_roundStart)
+    {
         return;
     }
 
@@ -733,8 +804,10 @@ TcpBbrV3::RaiseInflightHiSlope(Ptr<TcpSocketState> tcb)
     // Calculate "slope": packets S/ACKed per inflight_hi increment.
     uint32_t growthThisRound = 1u << m_bwProbeUpRounds;
     m_bwProbeUpRounds = std::min<uint8_t>(m_bwProbeUpRounds + 1, 30);
+    // Linux counts in packets, with a floor of one packet; this port counts
+    // ACKed bytes, so the floor is one segment.
     uint32_t cnt = tcb->m_cWnd.Get() / growthThisRound;
-    cnt = std::max<uint32_t>(cnt, 1);
+    cnt = std::max<uint32_t>(cnt, tcb->m_segmentSize);
     m_bwProbeUpCnt = cnt;
 }
 
@@ -742,7 +815,7 @@ void
 TcpBbrV3::ProbeInflightHiUpward(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
 {
     NS_LOG_FUNCTION(this << tcb << rs);
-    if (!tcb->m_isCwndLimited || tcb->m_cWnd.Get() < m_inflightHi)
+    if (!tcb->m_cwndLimitedInWindow || tcb->m_cWnd.Get() < m_inflightHi)
     {
         return; // not fully using inflight_hi, so don't grow it
     }
@@ -780,15 +853,72 @@ TcpBbrV3::HandleInflightTooHigh(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRa
     if (!rs.m_isAppLimited)
     {
         uint32_t cutTarget = static_cast<uint32_t>(TargetInflight(tcb) * (1.0 - m_beta));
-        m_inflightHi = std::max(rs.m_priorInFlight, cutTarget);
-        NS_LOG_DEBUG(Simulator::Now()
-                    << " loss/ECN too high while probing, cutting inflight_hi to "
-                    << m_inflightHi);
+        m_inflightHi = FloorSegments(std::max(rs.m_txInFlight, cutTarget));
+        NS_LOG_DEBUG(Simulator::Now() << " loss/ECN too high while probing, cutting inflight_hi to "
+                                      << m_inflightHi);
     }
     if (m_state == BbrMode_t::BBR_PROBE_BW && m_probeBwPhase == BBR_BW_PROBE_UP)
     {
         StartBwProbeDown();
     }
+}
+
+void
+TcpBbrV3::SkbMarkedLost(Ptr<TcpSocketState> tcb,
+                        const TcpTxItem::RateInformation& txInfo,
+                        uint32_t size,
+                        uint64_t totalLost)
+{
+    NS_LOG_FUNCTION(this << tcb << size << totalLost);
+    // Linux: bbr_skb_marked_lost(), starting with bbr_note_loss(). The loss
+    // round starts at the first loss, so bw_latest/inflight_latest span a full
+    // round trip of loss before AdaptLowerBounds() uses them. (Linux reads
+    // tp->delivered here; m_delivered is as of the previous ACK.)
+    if (!m_lossInRound)
+    {
+        m_lossRoundDelivered = static_cast<uint32_t>(m_delivered);
+    }
+    m_lossInRound = true;
+    m_lossInCycle = true;
+
+    if (!m_bwProbeSamples)
+    {
+        return; // not sent while probing for bandwidth
+    }
+    if (txInfo.m_deliveredTime == Time::Max())
+    {
+        return; // already SACKed/delivered
+    }
+    // The loss rate over the flight leading up to this segment.
+    TcpRateOps::TcpRateSample rs;
+    rs.m_txInFlight = txInfo.m_inFlight;
+    rs.m_lost = static_cast<uint32_t>(totalLost - txInfo.m_lost);
+    rs.m_isAppLimited = txInfo.m_isAppLimited;
+    if (IsInflightTooHigh(rs))
+    {
+        rs.m_txInFlight = InflightHiFromLostSkb(rs, size);
+        HandleInflightTooHigh(tcb, rs);
+    }
+}
+
+uint32_t
+TcpBbrV3::InflightHiFromLostSkb(const TcpRateOps::TcpRateSample& rs, uint32_t size) const
+{
+    // Linux: bbr_inflight_hi_from_lost_skb(), in bytes. Find the point within
+    // this segment at which the loss rate crossed loss_thresh.
+    if (rs.m_txInFlight < size || rs.m_lost < size)
+    {
+        return 0xFFFFFFFF;
+    }
+    double inflightPrev = rs.m_txInFlight - size; // in flight before this segment
+    double lostPrev = rs.m_lost - size;           // lost before this segment
+    double lossBudget = std::ceil(inflightPrev * m_lossThresh);
+    double lostPrefix = 0;
+    if (lostPrev < lossBudget)
+    {
+        lostPrefix = (lossBudget - lostPrev) / (1.0 - m_lossThresh);
+    }
+    return static_cast<uint32_t>(inflightPrev + lostPrefix);
 }
 
 void
@@ -853,9 +983,9 @@ TcpBbrV3::AdaptUpperBounds(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
 
         // To be resilient to random loss, raise bw/inflight_hi if we
         // observe in any phase that a higher level is safe.
-        if (rs.m_priorInFlight > m_inflightHi)
+        if (rs.m_txInFlight > m_inflightHi)
         {
-            m_inflightHi = rs.m_priorInFlight;
+            m_inflightHi = FloorSegments(rs.m_txInFlight);
         }
 
         if (m_state == BbrMode_t::BBR_PROBE_BW && m_probeBwPhase == BBR_BW_PROBE_UP)
@@ -905,6 +1035,16 @@ TcpBbrV3::CheckTimeToProbeBw(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateS
 }
 
 uint32_t
+TcpBbrV3::FloorSegments(uint32_t bytes) const
+{
+    if (bytes == 0xFFFFFFFF)
+    {
+        return bytes;
+    }
+    return bytes / m_segmentSize * m_segmentSize;
+}
+
+uint32_t
 TcpBbrV3::InflightWithHeadroom() const
 {
     NS_LOG_FUNCTION(this);
@@ -912,8 +1052,10 @@ TcpBbrV3::InflightWithHeadroom() const
     {
         return 0xFFFFFFFF;
     }
+    // Linux computes the headroom in packets, at least one.
     uint32_t headroom =
-        std::max<uint32_t>(static_cast<uint32_t>(m_inflightHi * m_inflightHeadroom), 1);
+        std::max<uint32_t>(FloorSegments(static_cast<uint32_t>(m_inflightHi * m_inflightHeadroom)),
+                           m_segmentSize);
     uint32_t withHeadroom = (m_inflightHi > headroom) ? (m_inflightHi - headroom) : 0;
     return std::max(withHeadroom, m_minPipeCwnd);
 }
@@ -949,13 +1091,8 @@ TcpBbrV3::UpdateCyclePhase(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
         return;
     }
 
-    // Linux computes `inflight` via bbr_packets_in_net_at_edt(), which
-    // adjusts prior_in_flight for data already "baked in" by earlier
-    // departure-time pacing decisions (EDT/FQ). ns-3's simpler pacing model
-    // doesn't expose that to congestion control, so we use the current
-    // bytes-in-flight directly -- the same simplification CheckDrain()
-    // already makes.
-    uint32_t inflight = tcb->m_bytesInFlight.Get();
+    // Linux: bbr_packets_in_net_at_edt(sk, rs->prior_in_flight).
+    uint32_t inflight = InflightAtEdt(tcb, rs.m_priorInFlight);
     DataRate bw = MaxBw();
 
     switch (m_probeBwPhase)
@@ -991,15 +1128,14 @@ TcpBbrV3::UpdateCyclePhase(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSam
     // bw growth recently and delivered bw has plateaued, (3)/(4) loss/ECN
     // filter says the rate is too high (checked in IsInflightTooHigh(),
     // via AdaptUpperBounds() above).
-    case BBR_BW_PROBE_UP:
-    {
+    case BBR_BW_PROBE_UP: {
         bool isBwProbeDone = false;
         if (m_prevProbeTooHigh && inflight >= m_inflightHi)
         {
             m_stoppedRiskyProbe = true;
             isBwProbeDone = true;
         }
-        else if (tcb->m_isCwndLimited && tcb->m_cWnd.Get() >= m_inflightHi)
+        else if (tcb->m_cwndLimitedInWindow && tcb->m_cWnd.Get() >= m_inflightHi)
         {
             // inflight_hi is limiting bw growth.
             ResetFullBw();
@@ -1086,6 +1222,7 @@ TcpBbrV3::CongControl(Ptr<TcpSocketState> tcb,
     // optimization (bbr_run_fast_path()) is intentionally not implemented.
 
     m_delivered = rc.m_delivered;
+    m_segmentSize = tcb->m_segmentSize;
 
     // Linux: bbr_update_round_start() is the first thing bbr_main() does.
     UpdateRound(tcb, rs);
@@ -1108,6 +1245,7 @@ TcpBbrV3::CongControl(Ptr<TcpSocketState> tcb,
     BoundCwndForInflightModel(tcb);
 
     AdvanceLatestDeliverySignals(tcb, rs);
+    m_prevCaState = tcb->m_congState;
 
     // Fields, in order (8 total, to stay under a typical MAX_CC_STATE_VARS
     // budget): last RTT (s), BbrMode_t, BbrProbeBwPhase_t (only meaningful
@@ -1135,8 +1273,7 @@ TcpBbrV3::Init(Ptr<TcpSocketState> tcb)
 }
 
 void
-TcpBbrV3::CongestionStateSet(Ptr<TcpSocketState> tcb,
-                             const TcpSocketState::TcpCongState_t newState)
+TcpBbrV3::CongestionStateSet(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCongState_t newState)
 {
     NS_LOG_FUNCTION(this << tcb << newState);
     if (newState == TcpSocketState::CA_OPEN && !m_isInitialized)
@@ -1151,6 +1288,8 @@ TcpBbrV3::CongestionStateSet(Ptr<TcpSocketState> tcb,
         m_targetCWnd = tcb->m_cWnd;
         m_minPipeCwnd = 4 * tcb->m_segmentSize;
         m_sendQuantum = 1 * tcb->m_segmentSize;
+        // Linux's threshold is 2^20 packets; this port counts bytes.
+        m_ackEpochAckedResetThresh = (1U << 20) * tcb->m_segmentSize;
         InitRoundCounting();
         InitFullPipe();
         EnterStartup();
@@ -1165,17 +1304,22 @@ TcpBbrV3::CongestionStateSet(Ptr<TcpSocketState> tcb,
     }
     else if (newState == TcpSocketState::CA_LOSS)
     {
+        // Linux: bbr_set_state(). Unlike v1, v3 does not cut cwnd or use
+        // packet conservation on entering fast recovery; loss is handled by
+        // the bw_lo/inflight_lo/inflight_hi model instead.
         NS_LOG_DEBUG("CongestionStateSet triggered to CA_LOSS :: " << newState);
-        SaveCwnd(tcb);
-        m_roundStart = true;
+        m_prevCaState = TcpSocketState::CA_LOSS;
+        ResetFullBw();
+        if (!IsProbingBandwidth() && m_inflightLo == 0xFFFFFFFF)
+        {
+            // AdaptLowerBounds() needs the cwnd from before the RTO.
+            m_inflightLo = std::max(tcb->m_cWnd.Get(), m_priorCwnd);
+        }
     }
-    else if (newState == TcpSocketState::CA_RECOVERY)
+    else if (tcb->m_congState == TcpSocketState::CA_LOSS && newState != TcpSocketState::CA_LOSS)
     {
-        NS_LOG_DEBUG("CongestionStateSet triggered to CA_RECOVERY :: " << newState);
-        SaveCwnd(tcb);
-        tcb->m_cWnd =
-            tcb->m_bytesInFlight.Get() + std::max(tcb->m_lastAckedSackedBytes, tcb->m_segmentSize);
-        m_packetConservation = true;
+        // Linux: bbr_exit_loss_recovery().
+        RestoreCwnd(tcb);
     }
 }
 
@@ -1234,7 +1378,9 @@ TcpBbrV3::AckAggregationCwnd()
     NS_LOG_FUNCTION(this);
     uint32_t maxAggrBytes; // MaxBW * 0.1 secs
     uint32_t aggrCwndBytes = 0;
-    if (m_extraAckedGain && m_isPipeFilled)
+    // Linux v3's bbr_ack_aggregation_cwnd() applies in STARTUP too; v1 only
+    // after the pipe was filled.
+    if (m_extraAckedGain)
     {
         maxAggrBytes = Bw().GetBitRate() / (10 * 8);
         aggrCwndBytes = m_extraAckedGain * std::max(m_extraAcked[0], m_extraAcked[1]);
@@ -1249,7 +1395,6 @@ TcpBbrV3::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRat
     NS_LOG_FUNCTION(this << tcb << rs);
     uint32_t expectedAcked;
     uint32_t extraAck;
-    uint32_t epochProp;
     if (!m_extraAckedGain || rs.m_ackedSacked <= 0 || rs.m_delivered < 0)
     {
         return;
@@ -1257,18 +1402,27 @@ TcpBbrV3::UpdateAckAggregation(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRat
     if (m_roundStart)
     {
         m_extraAckedWinRtt = std::min<uint32_t>(31, m_extraAckedWinRtt + 1);
-        if (m_extraAckedWinRtt >= m_extraAckedWinRttLength)
+        // As in Linux, STARTUP keeps only the last round's aggregation, so
+        // the larger excess seen while the bw estimate is still ramping up is
+        // not carried into PROBE_BW.
+        uint32_t winRttThresh = m_isPipeFilled ? m_extraAckedWinRttLength : 1;
+        if (m_extraAckedWinRtt >= winRttThresh)
         {
             m_extraAckedWinRtt = 0;
             m_extraAckedIdx = m_extraAckedIdx ? 0 : 1;
             m_extraAcked[m_extraAckedIdx] = 0;
         }
     }
-    epochProp = Simulator::Now().GetSeconds() - m_ackEpochTime.GetSeconds();
     // Linux's bbr_update_ack_aggregation() uses bbr_bw() (loss-bound
     // capped), not bbr_max_bw() -- same Bw()/MaxBw() split as
-    // SetPacingRate().
-    expectedAcked = Bw().GetBitRate() * epochProp / 8;
+    // SetPacingRate(). The epoch must keep sub-second resolution: truncating
+    // it to whole seconds makes expectedAcked 0 for the first second of every
+    // epoch, so all ACKed data counts as aggregation and pads cwnd by a full
+    // extra BDP.
+    Time epoch = Simulator::Now() - m_ackEpochTime;
+    expectedAcked =
+        static_cast<uint32_t>(std::min<double>(Bw().GetBitRate() * epoch.GetSeconds() / 8.0,
+                                               std::numeric_limits<uint32_t>::max()));
     if (m_ackEpochAcked <= expectedAcked ||
         (m_ackEpochAcked + rs.m_ackedSacked >= m_ackEpochAckedResetThresh))
     {
@@ -1293,28 +1447,31 @@ TcpBbrV3::InFlight(Ptr<TcpSocketState> tcb, DataRate bw, double gain)
     {
         return tcb->m_initialCWnd * tcb->m_segmentSize;
     }
-    double quanta = 3 * m_sendQuantum;
     double estimatedBdp = bw.GetBitRate() * m_minRtt.GetSeconds() / 8.0;
-    // v1 checked m_cycleIndex == 0 (the first of its 8 gain-cycle phases,
-    // i.e. "currently probing for more bandwidth with gain > 1"). v3's
-    // equivalent concept is being in the UP sub-state.
+    // Linux: bbr_quantization_budget(). v3 floors the BDP at 3 send quanta
+    // (and the min cwnd) rather than adding 3 quanta to it as v1 did.
+    double inflight = std::max(gain * estimatedBdp, 3.0 * m_sendQuantum);
+    inflight = std::max(inflight, static_cast<double>(m_minPipeCwnd));
     if (m_state == BbrMode_t::BBR_PROBE_BW && m_probeBwPhase == BBR_BW_PROBE_UP)
     {
-        return (gain * estimatedBdp) + quanta + (2 * tcb->m_segmentSize);
+        inflight += 2 * tcb->m_segmentSize;
     }
-    return (gain * estimatedBdp) + quanta;
+    return inflight;
 }
 
 uint32_t
 TcpBbrV3::ProbeRttCwnd(Ptr<TcpSocketState> tcb)
 {
     NS_LOG_FUNCTION(this << tcb);
-    // Linux calls bbr_bdp() directly here (no quantization padding); this
-    // port only has the padded InFlight() as its bdp-at-(bw,gain) utility, so
-    // -- consistent with every other InFlight() call site in this class --
-    // it's reused here too rather than adding a second, unpadded variant
-    // just for this one caller.
-    return std::max(InFlight(tcb, Bw(), m_probeRttCwndGain), m_minPipeCwnd);
+    // Linux: bbr_probe_rtt_cwnd() uses bbr_bdp(), without the quantization
+    // budget InFlight() adds.
+    if (m_minRtt == Time::Max())
+    {
+        return std::max(tcb->m_initialCWnd * tcb->m_segmentSize, m_minPipeCwnd);
+    }
+    auto bdp =
+        static_cast<uint32_t>(m_probeRttCwndGain * Bw().GetBitRate() * m_minRtt.GetSeconds() / 8.0);
+    return std::max(bdp, m_minPipeCwnd);
 }
 
 void
@@ -1330,7 +1487,11 @@ TcpBbrV3::CheckDrain(Ptr<TcpSocketState> tcb)
         tcb->m_ssThresh = InFlight(tcb, MaxBw(), 1);
         ResetCongestionSignals();
     }
-    if (m_state == BbrMode_t::BBR_DRAIN && tcb->m_bytesInFlight <= InFlight(tcb, MaxBw(), 1))
+    // The round bound (draft-ietf-ccwg-bbr-06 CheckDrainDone()) keeps an
+    // overestimated STARTUP bw from holding the flow in DRAIN indefinitely.
+    if (m_state == BbrMode_t::BBR_DRAIN &&
+        (InflightAtEdt(tcb, tcb->m_bytesInFlight) <= InFlight(tcb, MaxBw(), 1) ||
+         (m_drainMaxRounds > 0 && m_roundCount > m_drainStartRound + m_drainMaxRounds)))
     {
         EnterProbeBW();
     }
@@ -1343,7 +1504,8 @@ TcpBbrV3::UpdateRTprop(Ptr<TcpSocketState> tcb)
     // Linux: bbr_update_min_rtt(). Real BBRv3 uses a two-stage filter: a
     // short (default 5s) probe_rtt_win_ms window feeds the longer (default
     // 10s) min_rtt_win_sec window that the rest of this class reads via
-    // m_minRtt/m_minRttExpired -- unlike v1's simpler single 10s-windowed
+    // m_minRtt, and its expiry (m_probeRttExpired) schedules PROBE_RTT --
+    // unlike v1's simpler single 10s-windowed
     // filter (every RTT sample compared directly against one 10s window),
     // the short inner window lets m_minRtt track a real drop in RTT
     // responsively without waiting for the full 10s window to roll over.
@@ -1351,9 +1513,8 @@ TcpBbrV3::UpdateRTprop(Ptr<TcpSocketState> tcb)
     // The `!rs->is_ack_delayed` condition Linux adds to its forced-refresh
     // branch isn't ported -- ns-3's TcpRateSample doesn't track delayed-ACK
     // status, so a forced refresh here always takes tcb->m_lastRtt.
-    bool probeRttWinExpired = Simulator::Now() > (m_probeRttMinStamp + m_probeRttWinLen);
-    if (tcb->m_lastRtt.Get().IsPositive() &&
-        (tcb->m_lastRtt < m_probeRttMin || probeRttWinExpired))
+    m_probeRttExpired = Simulator::Now() > (m_probeRttMinStamp + m_probeRttWinLen);
+    if (tcb->m_lastRtt.Get().IsPositive() && (tcb->m_lastRtt < m_probeRttMin || m_probeRttExpired))
     {
         m_probeRttMin = tcb->m_lastRtt;
         m_probeRttMinStamp = Simulator::Now();
@@ -1371,11 +1532,15 @@ void
 TcpBbrV3::CheckProbeRTT(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
 {
     NS_LOG_FUNCTION(this << tcb << rs);
-    if (m_state != BbrMode_t::BBR_PROBE_RTT && m_minRttExpired && !m_idleRestart)
+    // Linux: PROBE_RTT is scheduled by the short probe_rtt_win_ms window,
+    // not by the 10s min_rtt window expiring.
+    if (m_state != BbrMode_t::BBR_PROBE_RTT && m_probeRttExpired && !m_idleRestart)
     {
         EnterProbeRTT();
         SaveCwnd(tcb);
         m_probeRttDoneStamp = Seconds(0);
+        m_ackPhase = BBR_ACKS_PROBE_STOPPING;
+        m_nextRoundDelivered = m_delivered;
     }
     if (m_state == BbrMode_t::BBR_PROBE_RTT)
     {
@@ -1391,7 +1556,7 @@ void
 TcpBbrV3::SaveCwnd(Ptr<const TcpSocketState> tcb)
 {
     NS_LOG_FUNCTION(this << tcb);
-    if (tcb->m_congState != TcpSocketState::CA_RECOVERY && m_state != BbrMode_t::BBR_PROBE_RTT)
+    if (m_prevCaState < TcpSocketState::CA_RECOVERY && m_state != BbrMode_t::BBR_PROBE_RTT)
     {
         m_priorCwnd = tcb->m_cWnd;
     }
@@ -1448,10 +1613,14 @@ TcpBbrV3::InitPacingRate(Ptr<TcpSocketState> tcb)
         NS_LOG_WARN("BBR must use pacing");
         tcb->m_pacing = true;
     }
+    // Linux: bbr_init_pacing_rate_from_rtt(), from the smoothed RTT (us
+    // resolution) and the STARTUP pacing gain. The bw filter itself starts
+    // empty (bbr_init(): bw_hi[0] = bw_hi[1] = 0); seeding it with this
+    // nominal rate would hold Bw() at the seed until a sample exceeded it.
     Time rtt;
-    if (tcb->m_minRtt != Time::Max())
+    if (!tcb->m_srtt.Get().IsZero() && tcb->m_srtt.Get() != Time::Max())
     {
-        rtt = MilliSeconds(std::max<long int>(tcb->m_minRtt.GetMilliSeconds(), 1));
+        rtt = std::max(tcb->m_srtt.Get(), MicroSeconds(1));
         m_hasSeenRtt = true;
     }
     else
@@ -1459,12 +1628,9 @@ TcpBbrV3::InitPacingRate(Ptr<TcpSocketState> tcb)
         rtt = MilliSeconds(1);
     }
     DataRate nominalBandwidth(tcb->m_cWnd * 8 / rtt.GetSeconds());
-    tcb->m_pacingRate = DataRate(m_pacingGain * nominalBandwidth.GetBitRate());
-    // v1 constructed a fresh WindowedFilter here. v3's 2-slot m_bwHi[] has
-    // no equivalent "reset/seed" constructor -- just seed both slots with
-    // the nominal bandwidth directly.
-    m_bwHi[0] = nominalBandwidth;
-    m_bwHi[1] = nominalBandwidth;
+    DataRate rate(m_highGain * nominalBandwidth.GetBitRate());
+    rate *= (1.f - m_pacingMargin);
+    tcb->m_pacingRate = std::min(rate, tcb->m_maxPacingRate);
 }
 
 void
@@ -1474,7 +1640,8 @@ TcpBbrV3::SetPacingRate(Ptr<TcpSocketState> tcb, double gain)
     DataRate rate(gain * Bw().GetBitRate());
     rate *= (1.f - m_pacingMargin);
     rate = std::min(rate, tcb->m_maxPacingRate);
-    if (!m_hasSeenRtt && tcb->m_minRtt != Time::Max())
+    // Linux: bbr_set_pacing_rate() re-initializes from the first RTT sample.
+    if (!m_hasSeenRtt && !tcb->m_srtt.Get().IsZero() && tcb->m_srtt.Get() != Time::Max())
     {
         InitPacingRate(tcb);
     }
@@ -1483,23 +1650,6 @@ TcpBbrV3::SetPacingRate(Ptr<TcpSocketState> tcb, double gain)
         tcb->m_pacingRate = rate;
         NS_LOG_DEBUG("Pacing rate updated. New value: " << tcb->m_pacingRate);
     }
-}
-
-bool
-TcpBbrV3::ModulateCwndForRecovery(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
-{
-    NS_LOG_FUNCTION(this << tcb << rs);
-    if (rs.m_bytesLoss > 0)
-    {
-        tcb->m_cWnd =
-            std::max((int)tcb->m_cWnd.Get() - (int)rs.m_bytesLoss, (int)tcb->m_segmentSize);
-    }
-    if (m_packetConservation)
-    {
-        tcb->m_cWnd = std::max(tcb->m_cWnd.Get(), tcb->m_bytesInFlight.Get() + rs.m_ackedSacked);
-        return true;
-    }
-    return false;
 }
 
 void
@@ -1516,7 +1666,49 @@ void
 TcpBbrV3::SetSendQuantum(Ptr<TcpSocketState> tcb)
 {
     NS_LOG_FUNCTION(this << tcb);
-    m_sendQuantum = 1 * tcb->m_segmentSize;
+    if (!m_tsoBursts)
+    {
+        m_sendQuantum = tcb->m_segmentSize;
+        tcb->m_sendQuantum = 0;
+        return;
+    }
+    m_sendQuantum = TsoSegsGoal(tcb);
+    tcb->m_sendQuantum = m_sendQuantum;
+}
+
+uint32_t
+TcpBbrV3::TsoSegsGoal(Ptr<TcpSocketState> tcb) const
+{
+    // Linux: bbr_tso_segs_generic(). About 1 ms of data at the pacing rate
+    // (sk_pacing_rate >> sk_pacing_shift, shift 10), plus 64 KB halved for
+    // every 2^9 us of min_rtt (tso_rtt_shift 9), capped at the 64 KB GSO
+    // size less MAX_TCP_HEADER, and at least tcp_min_tso_segs (2) segments.
+    uint64_t bytes = tcb->m_pacingRate.Get().GetBitRate() / 8 / 1024;
+    if (m_minRtt != Time::Max())
+    {
+        uint64_t r = static_cast<uint64_t>(m_minRtt.GetMicroSeconds()) >> 9;
+        if (r < 32)
+        {
+            bytes += 65536U >> r;
+        }
+    }
+    bytes = std::min<uint64_t>(bytes, 65536 - 1 - 320);
+    uint32_t segs = std::max<uint32_t>(bytes / tcb->m_segmentSize, 2);
+    return segs * tcb->m_segmentSize;
+}
+
+uint32_t
+TcpBbrV3::InflightAtEdt(Ptr<TcpSocketState> tcb, uint32_t inflightNow) const
+{
+    Time now = Simulator::Now();
+    Time interval = std::max(tcb->m_pacingRelease, now) - now;
+    auto delivered = static_cast<uint64_t>(Bw().GetBitRate() * interval.GetSeconds() / 8);
+    uint64_t inflight = inflightNow;
+    if (m_pacingGain > 1)
+    {
+        inflight += TsoSegsGoal(tcb); // the burst sent at the EDT
+    }
+    return delivered >= inflight ? 0 : static_cast<uint32_t>(inflight - delivered);
 }
 
 void
@@ -1536,19 +1728,13 @@ TcpBbrV3::SetCwnd(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
     {
         goto done;
     }
-    if (tcb->m_congState == TcpSocketState::CA_RECOVERY)
-    {
-        if (ModulateCwndForRecovery(tcb, rs))
-        {
-            goto done;
-        }
-    }
     UpdateTargetCwnd(tcb);
     if (m_isPipeFilled)
     {
         tcb->m_cWnd = std::min(tcb->m_cWnd.Get() + (uint32_t)rs.m_ackedSacked, m_targetCWnd);
     }
-    else if (tcb->m_cWnd < m_targetCWnd || m_delivered < tcb->m_initialCWnd * tcb->m_segmentSize)
+    else if (tcb->m_cWnd < m_targetCWnd ||
+             tcb->m_cWnd < 2 * tcb->m_initialCWnd * tcb->m_segmentSize)
     {
         tcb->m_cWnd = tcb->m_cWnd.Get() + rs.m_ackedSacked;
     }
