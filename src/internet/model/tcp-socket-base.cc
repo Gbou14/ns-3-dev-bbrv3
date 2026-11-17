@@ -10,7 +10,7 @@
 #define NS_LOG_APPEND_CONTEXT                                                                      \
     if (m_node)                                                                                    \
     {                                                                                              \
-        std::clog << " [node " << m_node->GetId() << "] ";                                         \
+        ns3LogStream << " [node " << m_node->GetId() << "] ";                                      \
     }
 
 #include "tcp-socket-base.h"
@@ -1992,6 +1992,24 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
 
     m_txBuffer->DiscardUpTo(ackNumber, MakeCallback(&TcpRateOps::SkbDelivered, m_rateOps));
 
+    // Without SACK, the guessed SACKs only have meaning during fast recovery
+    if (!m_sackEnabled && ackNumber > oldHeadSequence)
+    {
+        if (m_tcb->m_congState == TcpSocketState::CA_RECOVERY && ackNumber < m_recover)
+        {
+            // Partial ACK: the next segment is presumed lost (RFC 6582)
+            // and will be retransmitted
+            NS_LOG_INFO("Partial ACK. Manually setting head as lost");
+            m_txBuffer->MarkHeadAsLost();
+        }
+        else
+        {
+            // A cumulative ACK that advances outside of fast recovery,
+            // or that ends it, clears the guesses
+            m_txBuffer->ResetRenoSack();
+        }
+    }
+
     auto currentDelivered =
         static_cast<uint32_t>(m_rateOps->GetConnectionRate().m_delivered - previousDelivered);
     m_tcb->m_lastAckedSackedBytes = currentDelivered;
@@ -2204,13 +2222,6 @@ TcpSocketBase::ProcessAck(const SequenceNumber32& ackNumber,
         // the CA_RECOVERY phase. Just process this partial ack (RFC 5681)
         if (ackNumber < m_recover && m_tcb->m_congState == TcpSocketState::CA_RECOVERY)
         {
-            if (!m_sackEnabled)
-            {
-                // Manually set the head as lost, it will be retransmitted.
-                NS_LOG_INFO("Partial ACK. Manually setting head as lost");
-                m_txBuffer->MarkHeadAsLost();
-            }
-
             // Before retransmitting the packet perform DoRecovery and check if
             // there is available window
             if (!m_congestionControl->HasCongControl() && segsAcked >= 1)
@@ -4344,19 +4355,36 @@ TcpSocketBase::LastAckTimeout()
     }
 }
 
-// Send 1-byte data to probe for the window size at the receiver when
-// the local knowledge tells that the receiver has zero window size
-// C.f.: RFC793 p.42, RFC1112 sec.4.2.2.17
+// Send 1-byte data (or a zero-length segment, if there is no unsent data) to
+// probe for the window size at the receiver when the local knowledge tells
+// that the receiver has zero window size
+// C.f.: RFC793 p.42, RFC1122 sec.4.2.2.17, RFC9293 sec.3.8.6.1
 void
 TcpSocketBase::PersistTimeout()
 {
     NS_LOG_LOGIC("PersistTimeout expired at " << Simulator::Now().GetSeconds());
     m_persistTimeout =
         std::min(Seconds(60), Time(2 * m_persistTimeout)); // max persist timeout = 60s
-    Ptr<Packet> p = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence)->GetPacketCopy();
-    m_txBuffer->ResetLastSegmentSent();
+    // CopyFromSequence() returns nullptr when there is no unsent data. In that
+    // case, send a zero-length probe with an already acknowledged sequence
+    // number. The receiver finds it unacceptable and must answer with an ACK
+    // carrying its current window (@RFC{9293} sec 3.10.7.4, @issueid{1326}).
+    Ptr<Packet> p;
+    SequenceNumber32 probeSeq = m_tcb->m_nextTxSequence;
+    TcpTxItem* outItem = m_txBuffer->CopyFromSequence(1, m_tcb->m_nextTxSequence);
+    if (outItem != nullptr)
+    {
+        p = outItem->GetPacketCopy();
+        // The probe byte is not accounted as sent; return it to the unsent data
+        m_txBuffer->ResetLastSegmentSent();
+    }
+    else
+    {
+        p = Create<Packet>();
+        probeSeq = m_txBuffer->HeadSequence() - 1;
+    }
     TcpHeader tcpHeader;
-    tcpHeader.SetSequenceNumber(m_tcb->m_nextTxSequence);
+    tcpHeader.SetSequenceNumber(probeSeq);
     tcpHeader.SetAckNumber(m_tcb->m_rxBuffer->NextRxSequence());
     tcpHeader.SetWindowSize(AdvertisedWindowSize());
     if (m_endPoint != nullptr)

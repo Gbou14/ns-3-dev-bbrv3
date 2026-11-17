@@ -19,7 +19,11 @@ python3 make_figures.py          # rewrites figures/
   Config names are `rate/RTT/buffer`.
 - **Linux:** kernel 6.13.7 with Google's BBRv3, run with nsperf on Google
   Cloud. Three complete grid runs.
-- **ns-3:** each stage run with RngRun seeds 1, 2 and 3.
+- **ns-3:** each stage run with RngRun seeds 1, 2 and 3. Stages 4 and 6 also
+  with seeds 4, 5 and 6 (figure 13).
+- **Earlier versions:** the Aug 31, Oct 21 and Nov 10 versions of the port,
+  rebuilt and run on Nov 17 through the same harness and measure, seeds 1-3
+  (figure 12 and the slides). See "Earlier versions" below.
 - **Goodput:** cumulative-ACK progress at the sender, in 0.1 s bins, measured
   the same way on both sides (`data/goodput_bins.csv.gz`; `tools/` rebuilds it
   from the raw results).
@@ -45,6 +49,27 @@ python3 make_figures.py          # rewrites figures/
 | 4 | ACK-aggregation cwnd in STARTUP |
 | 5 | inflight at the next departure time; cwnd-limited tracked per window |
 | 6 | inflight_hi growth floor; pacing catch-up credit (final) |
+
+## Earlier versions
+
+| Version | Source | Run with |
+|---|---|---|
+| Aug 31 | the first port, on upstream ns-3 `7db999bf9` | draft-06 gains (the port had no gain attributes), standard ns-3 RTO |
+| Oct 21 | this repo at `548a189f0` (probing fixes) | draft-06 gains, standard ns-3 RTO |
+| Nov 10 | this repo at `5371dfa` (draft-06 defaults, ACK-aggregation epoch fix) | Linux gains, standard ns-3 RTO |
+
+Each was built with the comparison harness of today (its BBR state logging
+removed, since the old versions do not export that state), with the netem-style
+queue and the same goodput measure. None of them has `LinuxRto`, which arrived
+with stage 1. Aug 31 and Oct 21 cannot be given the Linux gains, so part of
+their distance comes from the draft-06 gains rather than from bugs. The Aug 31
+and Nov 10 results agree with the earlier measurements in `../FIX-LOG.md`
+(3.3 pp and 2.39 pp / 69 stalls).
+
+The Oct 21 version runs out of memory at 500/100/2 with seed 2: the simulation
+grows past 15 GB (8 GB RAM + 8 GB swap) and is killed at 43.5 s simulated time.
+It failed the same way when re-run alone, so it is a fault of that version.
+That config is left out of the Oct 21 averages (35 configs instead of 36).
 
 ## Figures
 
@@ -106,8 +131,40 @@ PROBE_RTT / PROBE_UP overlap described in [`../FIX-LOG.md`](../FIX-LOG.md)
 ![500/25/2](figures/11_series_500_25_2.png)
 Run 1 of Linux and seed 1 of each stage. The shaded window is what is scored.
 
+### 12. The port over time
+![history](figures/12_history.png)
+Every version from the first port to the final one, with the same measures as
+figure 1. The Oct 21 probing changes made the grid worse as a whole (more
+stalls) before the Nov 3-12 work brought it to within 0.3 pp of Linux's own
+noise.
+
+### 13. Stage 4 against stage 6, 6 seeds each
+![seeds](figures/13_stage4_vs_stage6_6_seeds.png)
+With 6 seeds each, stage 4 and stage 6 are equally close to Linux on distance
+(0.90 vs 0.92 pp; the per-pair ranges overlap). Stage 6 is closer at 0.1 BDP,
+which is what its fixes targeted, and further at 1 BDP, and it has more stalls
+(35.5 vs 26.3 per run; Linux 18.7).
+
+## Slides
+
+`figures/slides/` has the presentation versions (16:9, large text):
+
+| File | Shows |
+|---|---|
+| `s01_history_distance.png` | distance from Linux, every version |
+| `s02_history_stalls.png` | stalls per run, every version |
+| `s03_before_after_100_100_1.png` | goodput over time: Linux, the Aug 31 port (flow 1 starved after flow 2 joins) and the final port |
+| `s03_before_after_500_25_0.1.png` | the same at 500/25/0.1, where the Aug 31 port oscillates |
+| `s04_heatmap_before_after.png` | per-config distance: Aug 31, final, Linux vs Linux |
+| `s05_stages_distance.png` | distance for the six Nov 11-12 stages only |
+
+The bad-bin measure compares each flow with its own median, so a flow that is
+starved for the whole window (the Aug 31 port at 100/100/1) shows few bad bins.
+The slide titles therefore also give each flow's mean goodput in the window.
+
 ## Tables
 
-- `figures/summary_by_stage.csv`: the grid-level measures per stage.
+- `figures/summary_by_stage.csv`: the grid-level measures per stage, per
+  earlier version and for the 6-seed runs.
 - `figures/per_config_by_stage.csv`: bad bins, distance and stalls per config
   per stage.

@@ -1089,6 +1089,58 @@ It would only move PROBE_RTT timing, and only in configs where data samples
 can undercut the handshake RTT, so its effect would be configuration-specific
 rather than a fidelity fix.
 
+## November 17 2026: repository build and upstream merge (repository)
+
+Problem: this repository did not configure. Commit `cba52e7e5` (Oct 15) replaced
+`src/CMakeLists.txt` with the internet module's file. In addition, the fork's
+base (`230ea2a3f`) is newer than the tree the port was developed on
+(`7db999bf9`), and the full-file uploads of `tcp-congestion-ops.cc`,
+`tcp-socket-base.cc`, `tcp-tx-buffer.{cc,h}` and `src/internet/CMakeLists.txt`
+reverted upstream's changes to those files, including the fixes for issues
+#1107 and #1326. `tcp-tx-buffer` and `tcp-zero-window-test` failed.
+
+Fix: `src/CMakeLists.txt` restored from before `cba52e7e5`; the other five
+files three-way merged (port changes onto the new upstream versions), keeping
+both upstream's new test entries and the BBRv3 topology test in
+`src/internet/CMakeLists.txt`.
+
+Check: configured with examples and tests, all 398 test suites pass (53 TCP).
+Three configs re-run with the stage 6 settings (seed 2) give `run.csv` files
+identical to the stored stage 6 runs apart from the wall-clock column, so the
+merge changes no measured result.
+
+## November 17 2026: earlier versions through today's harness (measurement)
+
+To show the whole history on one scale, the Aug 31, Oct 21 and Nov 10 versions
+were rebuilt and run over the grid with seeds 1-3, through today's harness
+(netem-style queue, goodput from cumulative ACKs). Aug 31 and Oct 21 have no
+gain attributes and run with draft-06 gains; none has `LinuxRto`.
+
+| Version | Distance from Linux | Configs > 3 pp off | Stalls / run |
+|---|---|---|---|
+| Aug 31 | 3.20 pp | 11.3 | 61.7 |
+| Oct 21 | 3.72 | 13.4 | 111.3 |
+| Nov 10 | 2.23 | 7.2 | 69.0 |
+| stage 6 (final) | 0.97 | 1.8 | 36.3 |
+| Linux vs Linux | 0.69 | 0.7 | 18.7 |
+
+These agree with the earlier measurements: Aug 31 3.3 pp (Nov 10 status) and
+Nov 10 2.39 pp / 69 stalls with two seeds (Nov 11 status). The Oct 21 probing
+changes made the grid worse as a whole than the first port, mostly through
+stalls.
+
+The Oct 21 version cannot complete 500/100/2 with seed 2: memory grows past
+15 GB (8 GB RAM + 8 GB swap) and the run is killed at 43.5 s simulated time,
+both in the grid and when re-run alone. The Oct 21 numbers are over the other
+35 configs. Seeds 1 and 3, and every other version, complete it.
+
+Stages 4 and 6 were also run with seeds 4-6. With 6 seeds each the distance is
+0.90 (stage 4) and 0.92 pp (stage 6), with overlapping per-pair ranges, so
+neither is closer overall. Stage 6 is closer at 0.1 BDP (0.90 vs 1.16 pp, the
+target of its fixes) and further at 1 BDP (1.43 vs 1.13 pp), and has more
+stalls (35.5 vs 26.3 per run, Linux 18.7). The 1 BDP stalls stay the main open
+gap.
+
 ## Status on November 11 2026 (36 BBRv3 configs, Google Cloud VMs)
 
 Same harness for every row: netem-style queue limit, goodput from cumulative

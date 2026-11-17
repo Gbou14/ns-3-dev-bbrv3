@@ -28,6 +28,13 @@ SERIES = [
     ("stage6", ["ns3out_cred_s1", "ns3out_cred_s2", "ns3out_cred_s3"]),
     ("stage6_without_fix1", ["ns3out_nofix1_s1", "ns3out_nofix1_s2", "ns3out_nofix1_s3"]),
     ("stage6_without_fix2", ["ns3out_nofix2_s1", "ns3out_nofix2_s2", "ns3out_nofix2_s3"]),
+    # Earlier versions, run Nov 17 with today's harness (README: "Earlier versions").
+    ("aug31", ["ns3out_aug31_s1", "ns3out_aug31_s2", "ns3out_aug31_s3"]),
+    ("oct21", ["ns3out_oct21_s1", "ns3out_oct21_s2", "ns3out_oct21_s3"]),
+    ("nov10", ["ns3out_nov10h_s1", "ns3out_nov10h_s2", "ns3out_nov10h_s3"]),
+    # Stages 4 and 6 with seeds 4-6 added (runs 1-3 are the grids above).
+    ("stage4_6seeds", ["ns3out_aggrfull_s%d" % s for s in range(1, 7)]),
+    ("stage6_6seeds", ["ns3out_cred_s%d" % s for s in range(1, 7)]),
 ]
 NBINS = 600  # 0-60 s
 
